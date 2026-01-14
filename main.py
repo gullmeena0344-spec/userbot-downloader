@@ -20,13 +20,13 @@ DOWNLOAD_DIR = "downloads"
 SPLIT_SIZE = 1900 * 1024 * 1024
 COOKIES_FILE = "cookies.txt"
 
-VIDEO_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
+ALLOWED_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
 MEGA_RE = re.compile(r"https?://mega\.nz/")
-BUNKR_RE = re.compile(r"https?://(www\.)?bunkr\.(cr|pk|fi|ru)/")
+BUNKR_RE = re.compile(r"https?://(www\.)?bunkr\.")
 
 # ================= COOKIES =================
 
@@ -51,20 +51,13 @@ app = Client(
 
 # ================= HELPERS =================
 
-def collect_video_files(root):
+def collect_files(root):
     files = []
     for base, _, names in os.walk(root):
         for n in names:
             p = os.path.join(base, n)
-            if p.lower().endswith(tuple(e.lower() for e in VIDEO_EXT)):
+            if p.lower().endswith(ALLOWED_EXT):
                 files.append(p)
-    return files
-
-def collect_all_files(root):
-    files = []
-    for base, _, names in os.walk(root):
-        for n in names:
-            files.append(os.path.join(base, n))
     return files
 
 # ---------- PIXELDRAIN ----------
@@ -76,84 +69,34 @@ def download_pixeldrain(fid, path):
             if c:
                 f.write(c)
 
-# ---------- MEGA (mega-cmd primary, megatools fallback) ----------
+# ---------- MEGA ----------
 def download_mega(url):
-    if not ("mega.nz/file/" in url or "mega.nz/folder/" in url):
-        raise Exception("Invalid MEGA link (send file or folder link)")
+    subprocess.run(
+        ["megadl", "--recursive", "--path", DOWNLOAD_DIR, url],
+        check=True
+    )
 
-    # ---- primary: mega-cmd ----
-    try:
-        subprocess.run(["mega-cmd-server"], check=False)
-        subprocess.run(["mega-login"], check=False)
-        subprocess.run(["mega-get", url, DOWNLOAD_DIR], check=True)
-        return
-    except Exception:
-        pass
-
-    # ---- fallback: megatools ----
-    subprocess.run(["megadl", "--path", DOWNLOAD_DIR, url], check=True)
-
-# ---------- M3U8 DETECTION ----------
-def extract_m3u8(url):
-    try:
-        p = subprocess.run(
-            ["yt-dlp", "--cookies", COOKIES_FILE, "--dump-json", "--no-playlist", url],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        for line in p.stdout.splitlines():
-            if ".m3u8" in line:
-                return line.strip()
-    except Exception:
-        return None
-    return None
-
-# ---------- YT-DLP WITH FALLBACK ----------
+# ---------- YT-DLP ----------
 def download_ytdlp(url, out):
     parsed = urlparse(url)
     referer = f"{parsed.scheme}://{parsed.netloc}/"
 
-    try:
-        subprocess.run(
-            [
-                "yt-dlp",
-                "-f", "bv*+ba/best",
-                "--cookies", COOKIES_FILE,
-                "--user-agent", "Mozilla/5.0",
-                "--referer", referer,
-                "--add-header", f"Origin:{referer}",
-                "--allow-unplayable-formats",
-                "--merge-output-format", "mkv",
-                "--remux-video", "mp4",
-                "--no-playlist",
-                "-o", out,
-                url
-            ],
-            check=True
-        )
-        return
-    except subprocess.CalledProcessError:
-        pass
+    cmd = [
+        "yt-dlp",
+        "-f", "bv*+ba/best",
+        "--cookies", COOKIES_FILE,
+        "--user-agent", "Mozilla/5.0",
+        "--referer", referer,
+        "--add-header", f"Origin:{referer}",
+        "--merge-output-format", "mp4",
+        "--no-playlist",
+        "-o", out,
+        url
+    ]
 
-    m3u8 = extract_m3u8(url)
-    if not m3u8:
-        raise Exception("yt-dlp failed and no m3u8 found")
+    subprocess.run(cmd, check=True)
 
-    subprocess.run(
-        [
-            "yt-dlp",
-            "--cookies", COOKIES_FILE,
-            "--user-agent", "Mozilla/5.0",
-            "--referer", referer,
-            "--add-header", f"Origin:{referer}",
-            "-o", out,
-            m3u8
-        ],
-        check=True
-    )
-
-# ---------- FIX STREAMING ----------
+# ---------- FASTSTART + THUMB ----------
 def faststart_and_thumb(src):
     fixed = src.rsplit(".", 1)[0] + "_fixed.mp4"
     thumb = src.rsplit(".", 1)[0] + ".jpg"
@@ -201,62 +144,47 @@ async def handler(_, m: Message):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         if BUNKR_RE.search(url):
-            await status.edit("❌ Bunkr is blocked on Railway")
+            await status.edit("❌ Bunkr blocked on server")
             return
 
         if (px := PIXELDRAIN_RE.search(url)):
+            await status.edit("⬇️ Pixeldrain downloading...")
             fid = px.group(1)
-            info = requests.get(
-                f"https://pixeldrain.com/api/file/{fid}/info"
-            ).json()
+            info = requests.get(f"https://pixeldrain.com/api/file/{fid}/info").json()
             path = os.path.join(DOWNLOAD_DIR, info["name"])
-            await status.edit("⬇️ Downloading from Pixeldrain...")
             download_pixeldrain(fid, path)
 
         elif MEGA_RE.search(url):
-            await status.edit("⬇️ Downloading from MEGA...")
+            await status.edit("⬇️ MEGA downloading...")
             download_mega(url)
 
         else:
-            await status.edit("🎥 Extracting video (m3u8 fallback enabled)...")
+            await status.edit("🎥 yt-dlp downloading...")
             out = os.path.join(DOWNLOAD_DIR, "%(title).80s.%(ext)s")
             download_ytdlp(url, out)
 
-        # ---- collect files ----
-        files = collect_video_files(DOWNLOAD_DIR)
-
-        # MEGA fallback: upload everything if no videos detected
-        if not files and MEGA_RE.search(url):
-            files = collect_all_files(DOWNLOAD_DIR)
-
+        files = collect_files(DOWNLOAD_DIR)
         if not files:
-            raise Exception("No downloadable files found")
+            raise Exception("No video files found")
 
-        await status.edit(f"📦 Uploading {len(files)} file(s)...")
+        await status.edit(f"📤 Uploading {len(files)} file(s)...")
 
         for f in files:
-            if not os.path.isfile(f):
-                continue
+            fixed, thumb = faststart_and_thumb(f)
+            parts = [fixed] if os.path.getsize(fixed) < SPLIT_SIZE else split_file(fixed)
 
-            if f.lower().endswith(tuple(e.lower() for e in VIDEO_EXT)):
-                fixed, thumb = faststart_and_thumb(f)
-                parts = [fixed] if os.path.getsize(fixed) < SPLIT_SIZE else split_file(fixed)
+            for p in parts:
+                await app.send_video(
+                    chat_id=m.chat.id,  # ✅ FIXED
+                    video=p,
+                    thumb=thumb,
+                    supports_streaming=True,
+                    caption=os.path.basename(p),
+                )
+                os.remove(p)
 
-                for p in parts:
-                    await app.send_video(
-                        "me",
-                        video=p,
-                        thumb=thumb,
-                        supports_streaming=True,
-                        caption=os.path.basename(p),
-                    )
-                    os.remove(p)
-
-                if os.path.exists(thumb):
-                    os.remove(thumb)
-            else:
-                await app.send_document("me", document=f)
-                os.remove(f)
+            if os.path.exists(thumb):
+                os.remove(thumb)
 
         await status.edit("✅ Done")
 
