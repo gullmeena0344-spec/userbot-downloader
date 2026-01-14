@@ -46,22 +46,96 @@ app = Client(
 # ================= HELPERS =================
 
 def collect_files():
-    files = []
-    for f in os.listdir(DOWNLOAD_DIR):
-        p = os.path.join(DOWNLOAD_DIR, f)
-        if os.path.isfile(p):
-            files.append(p)
-    return files
+    return [
+        os.path.join(DOWNLOAD_DIR, f)
+        for f in os.listdir(DOWNLOAD_DIR)
+        if os.path.isfile(os.path.join(DOWNLOAD_DIR, f))
+    ]
 
-def faststart(src):
-    fixed = src.rsplit(".", 1)[0] + "_fixed.mp4"
+def get_codecs(path):
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path
+    ]
+    v = subprocess.check_output(cmd).decode().strip()
+
+    cmd[3] = "a:0"
+    a = subprocess.check_output(cmd).decode().strip()
+    return v, a
+
+def process_video(src):
+    """
+    1) Try fast remux
+    2) If codec not h264/aac -> force re-encode
+    """
+    remuxed = src.rsplit(".", 1)[0] + "_fixed.mp4"
+
+    # Fast remux
     subprocess.run(
-        ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
+        [
+            "ffmpeg", "-y",
+            "-i", src,
+            "-movflags", "+faststart",
+            "-map", "0",
+            "-c", "copy",
+            remuxed
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+    try:
+        v, a = get_codecs(remuxed)
+        if v == "h264" and a == "aac":
+            os.remove(src)
+            return remuxed
+    except Exception:
+        pass
+
+    # ❌ Codec bad → force re-encode
+    encoded = src.rsplit(".", 1)[0] + "_encoded.mp4"
+
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", src,
+            "-map", "0",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            encoded
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
     os.remove(src)
-    return fixed
+    if os.path.exists(remuxed):
+        os.remove(remuxed)
+
+    return encoded
+
+def generate_thumb(video):
+    thumb = video.rsplit(".", 1)[0] + ".jpg"
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", video,
+            "-ss", "00:00:01",
+            "-vframes", "1",
+            "-vf", "scale=320:-1",
+            thumb
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return thumb if os.path.exists(thumb) else None
 
 def split_file(path):
     parts = []
@@ -70,10 +144,10 @@ def split_file(path):
 
     with open(path, "rb") as f:
         for i in range(count):
-            part = f"{path}.part{i+1}.mp4"
-            with open(part, "wb") as o:
+            p = f"{path}.part{i+1}.mp4"
+            with open(p, "wb") as o:
                 o.write(f.read(SPLIT_SIZE))
-            parts.append(part)
+            parts.append(p)
 
     os.remove(path)
     return parts
@@ -99,30 +173,20 @@ async def ytdlp_download(url, status_msg):
         stderr=asyncio.subprocess.STDOUT
     )
 
-    last_edit = 0
-
+    last = 0
     while True:
         line = await process.stdout.readline()
         if not line:
             break
 
         text = line.decode(errors="ignore").strip()
-
         if "[download]" in text and "%" in text:
             now = asyncio.get_event_loop().time()
-            if now - last_edit < 1.2:
-                continue
-            last_edit = now
+            if now - last > 1.2:
+                last = now
+                await status_msg.edit(f"⬇️ **Downloading**\n\n`{text}`")
 
-            # example line:
-            # [download]  34.5% of 120.43MiB at 2.34MiB/s ETA 00:51
-            await status_msg.edit(
-                "⬇️ **Downloading**\n\n"
-                f"`{text}`"
-            )
-
-    code = await process.wait()
-    if code != 0:
+    if await process.wait() != 0:
         raise Exception("yt-dlp failed")
 
 # ================= HANDLER =================
@@ -145,25 +209,30 @@ async def handler(_, m: Message):
         if not files:
             raise Exception("No files downloaded")
 
-        await status.edit("📦 Processing video...")
+        await status.edit("🎬 Processing video...")
 
         for f in files:
-            fixed = faststart(f)
+            processed = process_video(f)
+            thumb = generate_thumb(processed)
 
             parts = (
-                [fixed]
-                if os.path.getsize(fixed) < SPLIT_SIZE
-                else split_file(fixed)
+                [processed]
+                if os.path.getsize(processed) < SPLIT_SIZE
+                else split_file(processed)
             )
 
             for p in parts:
                 await app.send_video(
                     "me",
                     video=p,
+                    thumb=thumb,
                     supports_streaming=True,
                     caption=os.path.basename(p),
                 )
                 os.remove(p)
+
+            if thumb and os.path.exists(thumb):
+                os.remove(thumb)
 
         await status.edit("✅ Done")
 
