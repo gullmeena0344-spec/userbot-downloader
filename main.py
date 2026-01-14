@@ -17,11 +17,10 @@ API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = "downloads"
-SPLIT_SIZE = 1900 * 1024 * 1024
+SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB
 COOKIES_FILE = "cookies.txt"
 
 ALLOWED_VIDEO_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
-ALLOWED_IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -29,10 +28,6 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
 MEGA_RE = re.compile(r"https?://mega\.nz/")
-IMGHEST_RE = re.compile(r"https?://(www\.)?imgchest\.com/p/([a-zA-Z0-9]+)")
-IMGBB_RE = re.compile(r"https?://(i\.)?imgbb\.com/([a-zA-Z0-9]+)")
-IMGUR_RE = re.compile(r"https?://(i\.)?imgur\.com/(a/|gallery/)?([a-zA-Z0-9]+)")
-JPG6_RE = re.compile(r"https?://(www\.)?jpg6\.com/([a-zA-Z0-9]+)")
 BUNKR_RE = re.compile(r"https?://(www\.)?bunkr\.")
 
 # ================= COOKIES =================
@@ -58,82 +53,32 @@ app = Client(
 
 # ================= HELPERS =================
 
-def collect_files(root, exts):
+def collect_videos(root):
     out = []
     for b, _, fs in os.walk(root):
         for f in fs:
             p = os.path.join(b, f)
-            if p.lower().endswith(exts):
+            if p.lower().endswith(ALLOWED_VIDEO_EXT):
                 out.append(p)
     return out
 
-def download_file(url, path):
-    with requests.get(url, stream=True, timeout=30) as r:
-        r.raise_for_status()
-        with open(path, "wb") as f:
-            for c in r.iter_content(1024 * 1024):
-                if c:
-                    f.write(c)
+# ================= PIXELDRAIN =================
 
-# ================= IMAGE HOSTS =================
+def download_pixeldrain(fid, path):
+    r = requests.get(f"https://pixeldrain.com/api/file/{fid}", stream=True)
+    r.raise_for_status()
+    with open(path, "wb") as f:
+        for c in r.iter_content(1024 * 1024):
+            if c:
+                f.write(c)
 
-def download_imgchest(pid):
-    api = f"https://api.imgchest.com/v1/post/{pid}"
-    data = requests.get(api).json()
-    imgs = data["data"]["images"]
-    paths = []
-    for i in imgs:
-        url = i["link"]
-        name = url.split("/")[-1].split("?")[0]
-        p = os.path.join(DOWNLOAD_DIR, name)
-        download_file(url, p)
-        paths.append(p)
-    return paths
-
-def download_imgbb(url):
-    html = requests.get(url).text
-    links = re.findall(r'https://i\.ibb\.co/[^"]+', html)
-    paths = []
-    for u in set(links):
-        name = u.split("/")[-1]
-        p = os.path.join(DOWNLOAD_DIR, name)
-        download_file(u, p)
-        paths.append(p)
-    return paths
-
-def download_imgur(url):
-    if "/a/" in url or "/gallery/" in url:
-        api = f"https://imgur.com/ajaxalbums/getimages/{url.split('/')[-1]}"
-        data = requests.get(api).json()["data"]["images"]
-        urls = [f"https://i.imgur.com/{i['hash']}{i['ext']}" for i in data]
-    else:
-        urls = [url if url.endswith(ALLOWED_IMAGE_EXT) else url + ".jpg"]
-
-    paths = []
-    for u in urls:
-        name = u.split("/")[-1]
-        p = os.path.join(DOWNLOAD_DIR, name)
-        download_file(u, p)
-        paths.append(p)
-    return paths
-
-def download_jpg6(pid):
-    html = requests.get(f"https://jpg6.com/{pid}").text
-    urls = re.findall(r'https://[^"]+\.jpg', html)
-    paths = []
-    for u in set(urls):
-        name = u.split("/")[-1]
-        p = os.path.join(DOWNLOAD_DIR, name)
-        download_file(u, p)
-        paths.append(p)
-    return paths
-
-# ================= MEGA =================
+# ================= MEGA (FIXED) =================
 
 def download_mega(url):
     env = os.environ.copy()
     env["HOME"] = "/root"
 
+    # Start MEGA daemon (required in Docker)
     subprocess.run(
         ["mega-cmd-server"],
         stdout=subprocess.DEVNULL,
@@ -143,58 +88,73 @@ def download_mega(url):
     )
 
     subprocess.run(
-        ["mega-get", "--ignore-quota-warn", "--recursive", url, DOWNLOAD_DIR],
+        [
+            "mega-get",
+            "--ignore-quota-warn",
+            "--recursive",
+            url,
+            DOWNLOAD_DIR
+        ],
         env=env,
         check=True
     )
 
-# ================= VIDEO =================
+# ================= VIDEO (yt-dlp) =================
 
 def download_ytdlp(url, out):
     parsed = urlparse(url)
-    ref = f"{parsed.scheme}://{parsed.netloc}/"
+    referer = f"{parsed.scheme}://{parsed.netloc}/"
+
     subprocess.run(
         [
             "yt-dlp",
             "--cookies", COOKIES_FILE,
-            "--user-agent", "Mozilla/5.0",
-            "--referer", ref,
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "--referer", referer,
             "--merge-output-format", "mp4",
+            "--no-playlist",
             "-o", out,
-            url,
+            url
         ],
         check=True
     )
 
+# ================= FASTSTART + THUMB =================
+
 def faststart_and_thumb(src):
-    fixed = src.replace(".mp4", "_fixed.mp4")
-    thumb = src.replace(".mp4", ".jpg")
+    fixed = src.rsplit(".", 1)[0] + "_fixed.mp4"
+    thumb = src.rsplit(".", 1)[0] + ".jpg"
 
     subprocess.run(
         ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
     )
+
     subprocess.run(
         ["ffmpeg", "-y", "-i", fixed, "-ss", "00:00:01", "-vframes", "1", thumb],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
     )
+
     os.remove(src)
     return fixed, thumb
 
-def split_file(p):
+# ================= SPLIT =================
+
+def split_file(path):
     parts = []
-    with open(p, "rb") as f:
-        i = 1
-        while True:
-            data = f.read(SPLIT_SIZE)
-            if not data:
-                break
-            part = f"{p}.part{i}.mp4"
+    size = os.path.getsize(path)
+    count = math.ceil(size / SPLIT_SIZE)
+
+    with open(path, "rb") as f:
+        for i in range(count):
+            part = f"{path}.part{i+1}.mp4"
             with open(part, "wb") as o:
-                o.write(data)
+                o.write(f.read(SPLIT_SIZE))
             parts.append(part)
-            i += 1
-    os.remove(p)
+
+    os.remove(path)
     return parts
 
 # ================= BOT =================
@@ -202,60 +162,71 @@ def split_file(p):
 @app.on_message(filters.private & filters.text)
 async def handler(_, m: Message):
     url = m.text.strip()
-    s = await m.reply("🔍 Processing...")
+    status = await m.reply("🔍 Processing link...")
 
     try:
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-        # BLOCKED
+        # Blocked
         if BUNKR_RE.search(url):
-            await s.edit("❌ Bunkr blocked")
+            await status.edit("❌ Bunkr is blocked on Railway")
             return
 
-        # IMAGES
-        if (x := IMGCHEST_RE.search(url)):
-            files = download_imgchest(x.group(2))
-        elif IMGBB_RE.search(url):
-            files = download_imgbb(url)
-        elif IMGUR_RE.search(url):
-            files = download_imgur(url)
-        elif (x := JPG6_RE.search(url)):
-            files = download_jpg6(x.group(2))
+        # Pixeldrain
+        if (px := PIXELDRAIN_RE.search(url)):
+            fid = px.group(1)
+            info = requests.get(
+                f"https://pixeldrain.com/api/file/{fid}/info"
+            ).json()
+
+            path = os.path.join(DOWNLOAD_DIR, info["name"])
+            await status.edit("⬇️ Downloading from Pixeldrain...")
+            download_pixeldrain(fid, path)
 
         # MEGA
         elif MEGA_RE.search(url):
-            await s.edit("⬇️ MEGA download...")
+            await status.edit("⬇️ Downloading from MEGA...")
             download_mega(url)
-            files = collect_files(DOWNLOAD_DIR, ALLOWED_VIDEO_EXT)
 
-        # VIDEO
+        # Video sites
         else:
-            await s.edit("🎥 Video download...")
+            await status.edit("🎥 Downloading video...")
             out = os.path.join(DOWNLOAD_DIR, "%(title).80s.%(ext)s")
             download_ytdlp(url, out)
-            files = collect_files(DOWNLOAD_DIR, ALLOWED_VIDEO_EXT)
 
+        files = collect_videos(DOWNLOAD_DIR)
         if not files:
-            raise Exception("No files found")
+            raise Exception("No video files found")
+
+        await status.edit(f"📦 Uploading {len(files)} file(s)...")
 
         for f in files:
-            if f.lower().endswith(ALLOWED_IMAGE_EXT):
-                await app.send_photo("me", photo=f)
-                os.remove(f)
-            else:
-                fixed, thumb = faststart_and_thumb(f)
-                parts = [fixed] if os.path.getsize(fixed) < SPLIT_SIZE else split_file(fixed)
-                for p in parts:
-                    await app.send_video("me", video=p, thumb=thumb, supports_streaming=True)
-                    os.remove(p)
-                if os.path.exists(thumb):
-                    os.remove(thumb)
+            fixed, thumb = faststart_and_thumb(f)
 
-        await s.edit("✅ Done")
+            parts = (
+                [fixed]
+                if os.path.getsize(fixed) < SPLIT_SIZE
+                else split_file(fixed)
+            )
+
+            for p in parts:
+                await app.send_video(
+                    "me",
+                    video=p,
+                    thumb=thumb,
+                    supports_streaming=True,
+                    caption=os.path.basename(p),
+                )
+                os.remove(p)
+
+            if os.path.exists(thumb):
+                os.remove(thumb)
+
+        await status.edit("✅ Done")
 
     except Exception as e:
-        await s.edit(f"❌ Error:\n`{e}`")
+        await status.edit(f"❌ Error:\n`{e}`")
 
     finally:
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
