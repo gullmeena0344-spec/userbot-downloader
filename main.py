@@ -8,14 +8,14 @@ import subprocess
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-# =============== CONFIG ==================
+# ================== CONFIG ==================
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = "downloads"
-SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB safe
+SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9 GB safe split
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -29,7 +29,7 @@ app = Client(
     session_string=SESSION_STRING,
 )
 
-# =============== HELPERS ==================
+# ================== HELPERS ==================
 
 def human(size):
     for unit in ["B", "KB", "MB", "GB"]:
@@ -87,15 +87,33 @@ def split_file(path):
 
     with open(path, "rb") as f:
         for i in range(count):
-            part = f"{path}.part{i+1}"
-            with open(part, "wb") as p:
+            part_path = f"{path}.part{i+1}.mp4"
+            with open(part_path, "wb") as p:
                 p.write(f.read(SPLIT_SIZE))
-            parts.append(part)
+            parts.append(part_path)
 
     os.remove(path)
     return parts
 
-# =============== BOT ==================
+
+def get_gofile_files(content_id):
+    server = requests.get("https://api.gofile.io/getServer").json()["data"]["server"]
+    r = requests.get(
+        f"https://{server}.gofile.io/getContent",
+        params={"contentId": content_id, "details": "true"},
+    )
+    data = r.json()
+
+    files = []
+    for f in data["data"]["contents"].values():
+        if f["type"] == "file":
+            files.append({
+                "name": f["name"],
+                "url": f["link"],
+            })
+    return files
+
+# ================== BOT ==================
 
 @app.on_message(filters.private & filters.text)
 async def handler(client: Client, message: Message):
@@ -123,15 +141,7 @@ async def handler(client: Client, message: Message):
             })
         else:
             cid = gf.group(1)
-            data = requests.get(
-                f"https://api.gofile.io/getContent?contentId={cid}"
-            ).json()
-            for f in data["data"]["contents"].values():
-                if f["type"] == "file":
-                    files.append({
-                        "name": f["name"],
-                        "url": f["link"],
-                    })
+            files = get_gofile_files(cid)
 
         for item in files:
             filename = item["name"]
@@ -146,7 +156,11 @@ async def handler(client: Client, message: Message):
                 os.remove(filepath)
                 filepath = new_path
 
-            parts = split_file(filepath) if os.path.getsize(filepath) > SPLIT_SIZE else [filepath]
+            parts = (
+                split_file(filepath)
+                if os.path.getsize(filepath) > SPLIT_SIZE
+                else [filepath]
+            )
 
             for i, part in enumerate(parts, 1):
                 await status.edit(f"📤 Uploading part {i}/{len(parts)}")
