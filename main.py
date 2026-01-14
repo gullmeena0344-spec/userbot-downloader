@@ -18,7 +18,7 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = "downloads"
 COOKIES_FILE = "cookies.txt"
-SPLIT_SIZE = 1900 * 1024 * 1024
+SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -46,17 +46,16 @@ app = Client(
 # ================= HELPERS =================
 
 def collect_files():
-    files = []
-    for f in os.listdir(DOWNLOAD_DIR):
-        p = os.path.join(DOWNLOAD_DIR, f)
-        if os.path.isfile(p):
-            files.append(p)
-    return files
+    return [
+        os.path.join(DOWNLOAD_DIR, f)
+        for f in os.listdir(DOWNLOAD_DIR)
+        if os.path.isfile(os.path.join(DOWNLOAD_DIR, f))
+    ]
 
 def faststart(src):
     fixed = src.rsplit(".", 1)[0] + "_fixed.mp4"
     subprocess.run(
-        ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
+        ["ffmpeg", "-y", "-i", src, "-map", "0", "-c", "copy", "-movflags", "+faststart", fixed],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -77,6 +76,45 @@ def split_file(path):
 
     os.remove(path)
     return parts
+
+# ================= THUMBNAIL (FIXED) =================
+
+def generate_thumb(video):
+    thumb = video.rsplit(".", 1)[0] + ".jpg"
+
+    try:
+        duration = float(subprocess.check_output([
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nw=1:nk=1",
+            video
+        ]).decode().strip())
+        seek = max(1, int(duration // 2))
+    except Exception:
+        seek = 1
+
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-ss", str(seek),
+            "-i", video,
+            "-vframes", "1",
+            "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+            "-q:v", "5",
+            thumb
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
+    if not os.path.exists(thumb):
+        return None
+
+    if os.path.getsize(thumb) > 200 * 1024:
+        os.remove(thumb)
+        return None
+
+    return thumb
 
 # ================= YT-DLP WITH PROGRESS =================
 
@@ -113,16 +151,12 @@ async def ytdlp_download(url, status_msg):
             if now - last_edit < 1.2:
                 continue
             last_edit = now
-
-            # example line:
-            # [download]  34.5% of 120.43MiB at 2.34MiB/s ETA 00:51
             await status_msg.edit(
                 "⬇️ **Downloading**\n\n"
                 f"`{text}`"
             )
 
-    code = await process.wait()
-    if code != 0:
+    if await process.wait() != 0:
         raise Exception("yt-dlp failed")
 
 # ================= HANDLER =================
@@ -149,6 +183,7 @@ async def handler(_, m: Message):
 
         for f in files:
             fixed = faststart(f)
+            thumb = generate_thumb(fixed)
 
             parts = (
                 [fixed]
@@ -160,10 +195,14 @@ async def handler(_, m: Message):
                 await app.send_video(
                     "me",
                     video=p,
+                    thumb=thumb,
                     supports_streaming=True,
                     caption=os.path.basename(p),
                 )
                 os.remove(p)
+
+            if thumb and os.path.exists(thumb):
+                os.remove(thumb)
 
         await status.edit("✅ Done")
 
@@ -173,5 +212,7 @@ async def handler(_, m: Message):
     finally:
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# ================= RUN =================
 
 app.run()
