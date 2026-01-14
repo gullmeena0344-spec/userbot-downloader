@@ -2,22 +2,31 @@ import os
 import re
 import asyncio
 import subprocess
+import shutil
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
-SESSION = os.environ.get("SESSION", "user")
+# ================= CONFIG =================
+
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+SESSION_STRING = os.environ["SESSION_STRING"]
 
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-app = Client(SESSION, api_id=API_ID, api_hash=API_HASH)
-
 URL_RE = re.compile(r"https?://\S+")
 
+# ================= CLIENT =================
 
-# ---------- UTILS ----------
+app = Client(
+    "userbot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING
+)
+
+# ================= UTILS =================
 
 def get_codecs(path):
     v = subprocess.check_output([
@@ -60,7 +69,7 @@ def process_video(src):
     base = src.rsplit(".", 1)[0]
     remuxed = base + "_remux.mp4"
 
-    # 1️⃣ SAFE REMUX
+    # ---- SAFE REMUX ----
     subprocess.run(
         [
             "ffmpeg", "-y",
@@ -83,9 +92,8 @@ def process_video(src):
         except Exception:
             pass
 
-    # 2️⃣ FORCE RE-ENCODE (ONLY IF REQUIRED)
+    # ---- FORCE RE-ENCODE ----
     encoded = base + "_encoded.mp4"
-
     subprocess.run(
         [
             "ffmpeg", "-y",
@@ -107,7 +115,7 @@ def process_video(src):
     )
 
     if not os.path.exists(encoded) or os.path.getsize(encoded) < 5 * 1024 * 1024:
-        raise Exception("FFmpeg failed")
+        raise Exception("FFmpeg encoding failed")
 
     os.remove(src)
     if os.path.exists(remuxed):
@@ -142,18 +150,21 @@ async def yt_download(url):
     return files[0] if files else None
 
 
-# ---------- HANDLER ----------
+# ================= HANDLER =================
 
 @app.on_message(filters.text)
 async def handler(_, msg: Message):
-    urls = URL_RE.findall(msg.text)
+    urls = URL_RE.findall(msg.text or "")
     if not urls:
         return
 
     url = urls[0]
-    status = await msg.reply("⬇️ Downloading...")
+    status = await msg.reply("⬇️ Downloading…")
 
     try:
+        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
         file = await yt_download(url)
         if not file:
             await status.edit("❌ Download failed")
@@ -162,7 +173,7 @@ async def handler(_, msg: Message):
         file = process_video(file)
         thumb = generate_thumb(file)
 
-        await status.edit("⬆️ Uploading...")
+        await status.edit("⬆️ Uploading…")
 
         await app.send_video(
             "me",
@@ -174,14 +185,14 @@ async def handler(_, msg: Message):
 
         await status.delete()
 
-        if thumb and os.path.exists(thumb):
-            os.remove(thumb)
-        os.remove(file)
-
     except Exception as e:
-        await status.edit(f"❌ Error:\n{e}")
+        await status.edit(f"❌ Error:\n`{e}`")
+
+    finally:
+        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
-# ---------- RUN ----------
+# ================= RUN =================
 
 app.run()
