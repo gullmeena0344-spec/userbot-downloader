@@ -6,6 +6,7 @@ import subprocess
 import requests
 import base64
 from urllib.parse import urlparse
+
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
@@ -19,9 +20,7 @@ DOWNLOAD_DIR = "downloads"
 SPLIT_SIZE = 1900 * 1024 * 1024
 COOKIES_FILE = "cookies.txt"
 
-ALLOWED_EXT = (
-    ".mp4", ".mkv", ".webm", ".avi", ".mov"
-)
+ALLOWED_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -62,7 +61,6 @@ def collect_files(root):
     return files
 
 def normalize_mega_url(url: str) -> str:
-    # megadl CANNOT handle /folder/... sub paths
     if "/folder/" in url:
         return url.split("/folder/")[0]
     return url
@@ -84,22 +82,74 @@ def download_mega(url):
         check=True
     )
 
-# ---------- YT-DLP ----------
+# ---------- M3U8 DETECTION ----------
+def extract_m3u8(url):
+    """
+    Uses yt-dlp to print m3u8 URL without downloading
+    """
+    try:
+        p = subprocess.run(
+            [
+                "yt-dlp",
+                "--cookies", COOKIES_FILE,
+                "--dump-json",
+                "--no-playlist",
+                url
+            ],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        for line in p.stdout.splitlines():
+            if ".m3u8" in line:
+                return line.strip()
+    except Exception:
+        return None
+    return None
+
+# ---------- YT-DLP WITH FALLBACK ----------
 def download_ytdlp(url, out):
     parsed = urlparse(url)
     referer = f"{parsed.scheme}://{parsed.netloc}/"
 
-    subprocess.run([
+    base_cmd = [
         "yt-dlp",
-        "--no-playlist",
+        "-f", "bv*+ba/best",
         "--cookies", COOKIES_FILE,
-        "--user-agent", "Mozilla/5.0",
-        "--add-header", f"Referer:{referer}",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "--referer", referer,
         "--add-header", f"Origin:{referer}",
-        "--merge-output-format", "mp4",
+        "--allow-unplayable-formats",
+        "--merge-output-format", "mkv",
+        "--remux-video", "mp4",
+        "--no-playlist",
         "-o", out,
         url
-    ], check=True)
+    ]
+
+    try:
+        subprocess.run(base_cmd, check=True)
+        return
+    except subprocess.CalledProcessError:
+        pass  # fallback below
+
+    # ---- m3u8 fallback ----
+    m3u8 = extract_m3u8(url)
+    if not m3u8:
+        raise Exception("yt-dlp failed and no m3u8 found")
+
+    subprocess.run(
+        [
+            "yt-dlp",
+            "--cookies", COOKIES_FILE,
+            "--user-agent", "Mozilla/5.0",
+            "--referer", referer,
+            "--add-header", f"Origin:{referer}",
+            "-o", out,
+            m3u8
+        ],
+        check=True
+    )
 
 # ---------- FIX STREAMING ----------
 def faststart_and_thumb(src):
@@ -148,12 +198,10 @@ async def handler(_, m: Message):
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-        # ❌ BUNKR (Railway blocked)
         if BUNKR_RE.search(url):
             await status.edit("❌ Bunkr is blocked on Railway")
             return
 
-        # PIXELDRAIN
         if (px := PIXELDRAIN_RE.search(url)):
             fid = px.group(1)
             info = requests.get(
@@ -163,15 +211,13 @@ async def handler(_, m: Message):
             await status.edit("⬇️ Downloading from Pixeldrain...")
             download_pixeldrain(fid, path)
 
-        # MEGA
         elif MEGA_RE.search(url):
             await status.edit("⬇️ Downloading from MEGA...")
             download_mega(url)
 
-        # OTHER (HLS / MP4 / WEBPAGE)
         else:
-            await status.edit("🎥 Extracting video...")
-            out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
+            await status.edit("🎥 Extracting video (m3u8 fallback enabled)...")
+            out = os.path.join(DOWNLOAD_DIR, "%(title).80s.%(ext)s")
             download_ytdlp(url, out)
 
         files = collect_files(DOWNLOAD_DIR)
