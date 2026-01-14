@@ -53,13 +53,19 @@ app = Client(
 # ================= HELPERS =================
 
 def collect_files(root):
-    result = []
-    for base, _, files in os.walk(root):
-        for f in files:
-            path = os.path.join(base, f)
-            if path.lower().endswith(ALLOWED_EXT):
-                result.append(path)
-    return result
+    files = []
+    for base, _, names in os.walk(root):
+        for n in names:
+            p = os.path.join(base, n)
+            if p.lower().endswith(ALLOWED_EXT):
+                files.append(p)
+    return files
+
+def normalize_mega_url(url: str) -> str:
+    # megadl CANNOT handle /folder/... sub paths
+    if "/folder/" in url:
+        return url.split("/folder/")[0]
+    return url
 
 # ---------- PIXELDRAIN ----------
 def download_pixeldrain(fid, path):
@@ -72,6 +78,7 @@ def download_pixeldrain(fid, path):
 
 # ---------- MEGA ----------
 def download_mega(url):
+    url = normalize_mega_url(url)
     subprocess.run(
         ["megadl", "--recursive", "--path", DOWNLOAD_DIR, url],
         check=True
@@ -141,9 +148,9 @@ async def handler(_, m: Message):
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-        # ❌ BUNKR
+        # ❌ BUNKR (Railway blocked)
         if BUNKR_RE.search(url):
-            await status.edit("❌ Bunkr blocked on Railway")
+            await status.edit("❌ Bunkr is blocked on Railway")
             return
 
         # PIXELDRAIN
@@ -161,7 +168,7 @@ async def handler(_, m: Message):
             await status.edit("⬇️ Downloading from MEGA...")
             download_mega(url)
 
-        # OTHER
+        # OTHER (HLS / MP4 / WEBPAGE)
         else:
             await status.edit("🎥 Extracting video...")
             out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
@@ -171,7 +178,7 @@ async def handler(_, m: Message):
         if not files:
             raise Exception("No videos found")
 
-        await status.edit(f"📦 Uploading {len(files)} video(s)...")
+        await status.edit(f"📦 Uploading {len(files)} file(s)...")
 
         for f in files:
             fixed, thumb = faststart_and_thumb(f)
@@ -195,10 +202,11 @@ async def handler(_, m: Message):
             if os.path.exists(thumb):
                 os.remove(thumb)
 
-        await status.edit("✅ Done (thumbnail fixed)")
+        await status.edit("✅ Done")
 
     except Exception as e:
         await status.edit(f"❌ Error:\n`{e}`")
+
     finally:
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
