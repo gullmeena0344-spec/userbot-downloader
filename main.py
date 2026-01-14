@@ -15,7 +15,7 @@ from pyrogram.types import Message
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
-GOFILE_TOKEN = os.getenv("GOFILE_TOKEN")
+GOFILE_TOKEN = os.getenv("GOFILE_TOKEN")  # optional fallback
 
 DOWNLOAD_DIR = "downloads"
 SPLIT_SIZE = 1900 * 1024 * 1024
@@ -56,18 +56,20 @@ app = Client(
 # ================= HELPERS =================
 
 def collect_files(root):
-    files = []
-    for base, _, names in os.walk(root):
-        for n in names:
-            p = os.path.join(base, n)
+    out = []
+    for base, _, files in os.walk(root):
+        for f in files:
+            p = os.path.join(base, f)
             if p.lower().endswith(ALLOWED_EXT):
-                files.append(p)
-    return files
+                out.append(p)
+    return out
 
-def normalize_mega_url(url: str) -> str:
+def normalize_mega_url(url):
     if "/folder/" in url:
         return url.split("/folder/")[0]
     return url
+
+# ================= DOWNLOADERS =================
 
 # ---------- PIXELDRAIN ----------
 def download_pixeldrain(fid, path):
@@ -80,24 +82,26 @@ def download_pixeldrain(fid, path):
 
 # ---------- MEGA ----------
 def download_mega(url):
-    url = normalize_mega_url(url)
     subprocess.run(
-        ["megadl", "--recursive", "--path", DOWNLOAD_DIR, url],
+        ["megadl", "--recursive", "--path", DOWNLOAD_DIR, normalize_mega_url(url)],
         check=True
     )
 
-# ---------- GOFILE (PUBLIC) ----------
+# ---------- GOFILE (PUBLIC FIXED) ----------
 def download_gofile_public(folder_id):
-    r = requests.get(f"https://api.gofile.io/contents/{folder_id}", timeout=20)
+    r = requests.get(
+        f"https://api.gofile.io/contents/{folder_id}",
+        params={"wt": "4fd6sg89d7s6"},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=20
+    )
     r.raise_for_status()
     data = r.json()
 
     if data.get("status") != "ok":
-        raise Exception("Public GoFile API failed")
+        raise Exception("Public GoFile blocked")
 
-    contents = data["data"]["contents"]
-
-    for _, info in contents.items():
+    for info in data["data"]["contents"].values():
         if info["type"] != "file":
             continue
 
@@ -105,10 +109,8 @@ def download_gofile_public(folder_id):
         if not name.lower().endswith(ALLOWED_EXT):
             continue
 
-        url = info["link"]
         path = os.path.join(DOWNLOAD_DIR, name)
-
-        with requests.get(url, stream=True) as d:
+        with requests.get(info["link"], stream=True) as d:
             d.raise_for_status()
             with open(path, "wb") as f:
                 for chunk in d.iter_content(1024 * 1024):
@@ -120,24 +122,21 @@ def download_gofile_token(folder_id):
     if not GOFILE_TOKEN:
         raise Exception("GOFILE_TOKEN not set")
 
-    headers = {
-        "Authorization": f"Bearer {GOFILE_TOKEN}"
-    }
-
     r = requests.get(
         f"https://api.gofile.io/contents/{folder_id}",
-        headers=headers,
+        headers={
+            "Authorization": f"Bearer {GOFILE_TOKEN}",
+            "User-Agent": "Mozilla/5.0"
+        },
         timeout=20
     )
     r.raise_for_status()
     data = r.json()
 
     if data.get("status") != "ok":
-        raise Exception("Token GoFile API failed")
+        raise Exception("Token GoFile blocked")
 
-    contents = data["data"]["contents"]
-
-    for _, info in contents.items():
+    for info in data["data"]["contents"].values():
         if info["type"] != "file":
             continue
 
@@ -146,9 +145,7 @@ def download_gofile_token(folder_id):
             continue
 
         path = os.path.join(DOWNLOAD_DIR, name)
-        url = info["link"]
-
-        with requests.get(url, stream=True) as d:
+        with requests.get(info["link"], stream=True) as d:
             d.raise_for_status()
             with open(path, "wb") as f:
                 for chunk in d.iter_content(1024 * 1024):
@@ -157,16 +154,16 @@ def download_gofile_token(folder_id):
 
 # ---------- YT-DLP (UNCHANGED) ----------
 def download_ytdlp(url, out):
-    parsed = urlparse(url)
-    referer = f"{parsed.scheme}://{parsed.netloc}/"
+    p = urlparse(url)
+    ref = f"{p.scheme}://{p.netloc}/"
 
     subprocess.run([
         "yt-dlp",
         "--no-playlist",
         "--cookies", COOKIES_FILE,
         "--user-agent", "Mozilla/5.0",
-        "--add-header", f"Referer:{referer}",
-        "--add-header", f"Origin:{referer}",
+        "--add-header", f"Referer:{ref}",
+        "--add-header", f"Origin:{ref}",
         "--merge-output-format", "mp4",
         "-o", out,
         url
@@ -194,60 +191,55 @@ def faststart_and_thumb(src):
 
 # ---------- SPLIT ----------
 def split_file(path):
-    parts = []
     size = os.path.getsize(path)
-    count = math.ceil(size / SPLIT_SIZE)
+    parts = math.ceil(size / SPLIT_SIZE)
+    out = []
 
     with open(path, "rb") as f:
-        for i in range(count):
-            part = f"{path}.part{i+1}.mp4"
-            with open(part, "wb") as o:
+        for i in range(parts):
+            p = f"{path}.part{i+1}.mp4"
+            with open(p, "wb") as o:
                 o.write(f.read(SPLIT_SIZE))
-            parts.append(part)
+            out.append(p)
 
     os.remove(path)
-    return parts
+    return out
 
 # ================= USERBOT =================
 
 @app.on_message(filters.private & filters.text)
 async def handler(_, m: Message):
     url = m.text.strip()
-    status = await m.reply("🔍 Processing link...")
+    status = await m.reply("🔍 Processing...")
 
     try:
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         if BUNKR_RE.search(url):
-            await status.edit("❌ Bunkr is blocked on Railway")
+            await status.edit("❌ Bunkr blocked on Railway")
             return
 
         if (px := PIXELDRAIN_RE.search(url)):
-            fid = px.group(1)
-            info = requests.get(
-                f"https://pixeldrain.com/api/file/{fid}/info"
-            ).json()
-            path = os.path.join(DOWNLOAD_DIR, info["name"])
-            await status.edit("⬇️ Downloading from Pixeldrain...")
-            download_pixeldrain(fid, path)
+            await status.edit("⬇️ Pixeldrain...")
+            info = requests.get(f"https://pixeldrain.com/api/file/{px.group(1)}/info").json()
+            download_pixeldrain(px.group(1), os.path.join(DOWNLOAD_DIR, info["name"]))
 
         elif (gf := GOFILE_RE.search(url)):
-            await status.edit("⬇️ Downloading from GoFile (public)...")
+            await status.edit("⬇️ GoFile (public)...")
             try:
                 download_gofile_public(gf.group(1))
             except Exception:
-                await status.edit("🔐 Public blocked, trying token...")
+                await status.edit("🔐 GoFile token fallback...")
                 download_gofile_token(gf.group(1))
-
+            # ⛔ STOP HERE – NEVER yt-dlp
         elif MEGA_RE.search(url):
-            await status.edit("⬇️ Downloading from MEGA...")
+            await status.edit("⬇️ MEGA...")
             download_mega(url)
 
         else:
-            await status.edit("🎥 Extracting video...")
-            out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
-            download_ytdlp(url, out)
+            await status.edit("🎥 yt-dlp...")
+            download_ytdlp(url, os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"))
 
         files = collect_files(DOWNLOAD_DIR)
         if not files:
@@ -257,12 +249,7 @@ async def handler(_, m: Message):
 
         for f in files:
             fixed, thumb = faststart_and_thumb(f)
-
-            parts = (
-                [fixed]
-                if os.path.getsize(fixed) < SPLIT_SIZE
-                else split_file(fixed)
-            )
+            parts = [fixed] if os.path.getsize(fixed) < SPLIT_SIZE else split_file(fixed)
 
             for p in parts:
                 await app.send_video(
@@ -270,7 +257,7 @@ async def handler(_, m: Message):
                     video=p,
                     thumb=thumb,
                     supports_streaming=True,
-                    caption=os.path.basename(p),
+                    caption=os.path.basename(p)
                 )
                 os.remove(p)
 
