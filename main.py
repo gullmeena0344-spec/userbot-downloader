@@ -20,7 +20,7 @@ DOWNLOAD_DIR = "downloads"
 SPLIT_SIZE = 1900 * 1024 * 1024
 COOKIES_FILE = "cookies.txt"
 
-ALLOWED_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
+VIDEO_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -51,13 +51,20 @@ app = Client(
 
 # ================= HELPERS =================
 
-def collect_files(root):
+def collect_video_files(root):
     files = []
     for base, _, names in os.walk(root):
         for n in names:
             p = os.path.join(base, n)
-            if p.lower().endswith(ALLOWED_EXT):
+            if p.lower().endswith(tuple(e.lower() for e in VIDEO_EXT)):
                 files.append(p)
+    return files
+
+def collect_all_files(root):
+    files = []
+    for base, _, names in os.walk(root):
+        for n in names:
+            files.append(os.path.join(base, n))
     return files
 
 # ---------- PIXELDRAIN ----------
@@ -74,48 +81,23 @@ def download_mega(url):
     if not ("mega.nz/file/" in url or "mega.nz/folder/" in url):
         raise Exception("Invalid MEGA link (send file or folder link)")
 
-    # ---- PRIMARY: mega-cmd ----
+    # ---- primary: mega-cmd ----
     try:
-        subprocess.run(
-            ["mega-cmd-server"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False
-        )
-
-        subprocess.run(
-            ["mega-login"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False
-        )
-
-        subprocess.run(
-            ["mega-get", url, DOWNLOAD_DIR],
-            check=True
-        )
+        subprocess.run(["mega-cmd-server"], check=False)
+        subprocess.run(["mega-login"], check=False)
+        subprocess.run(["mega-get", url, DOWNLOAD_DIR], check=True)
         return
-
     except Exception:
-        pass  # fallback below
+        pass
 
-    # ---- FALLBACK: megatools (megadl) ----
-    subprocess.run(
-        ["megadl", "--path", DOWNLOAD_DIR, url],
-        check=True
-    )
+    # ---- fallback: megatools ----
+    subprocess.run(["megadl", "--path", DOWNLOAD_DIR, url], check=True)
 
 # ---------- M3U8 DETECTION ----------
 def extract_m3u8(url):
     try:
         p = subprocess.run(
-            [
-                "yt-dlp",
-                "--cookies", COOKIES_FILE,
-                "--dump-json",
-                "--no-playlist",
-                url
-            ],
+            ["yt-dlp", "--cookies", COOKIES_FILE, "--dump-json", "--no-playlist", url],
             capture_output=True,
             text=True,
             check=True
@@ -132,23 +114,24 @@ def download_ytdlp(url, out):
     parsed = urlparse(url)
     referer = f"{parsed.scheme}://{parsed.netloc}/"
 
-    base_cmd = [
-        "yt-dlp",
-        "-f", "bv*+ba/best",
-        "--cookies", COOKIES_FILE,
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "--referer", referer,
-        "--add-header", f"Origin:{referer}",
-        "--allow-unplayable-formats",
-        "--merge-output-format", "mkv",
-        "--remux-video", "mp4",
-        "--no-playlist",
-        "-o", out,
-        url
-    ]
-
     try:
-        subprocess.run(base_cmd, check=True)
+        subprocess.run(
+            [
+                "yt-dlp",
+                "-f", "bv*+ba/best",
+                "--cookies", COOKIES_FILE,
+                "--user-agent", "Mozilla/5.0",
+                "--referer", referer,
+                "--add-header", f"Origin:{referer}",
+                "--allow-unplayable-formats",
+                "--merge-output-format", "mkv",
+                "--remux-video", "mp4",
+                "--no-playlist",
+                "-o", out,
+                url
+            ],
+            check=True
+        )
         return
     except subprocess.CalledProcessError:
         pass
@@ -239,33 +222,41 @@ async def handler(_, m: Message):
             out = os.path.join(DOWNLOAD_DIR, "%(title).80s.%(ext)s")
             download_ytdlp(url, out)
 
-        files = collect_files(DOWNLOAD_DIR)
+        # ---- collect files ----
+        files = collect_video_files(DOWNLOAD_DIR)
+
+        # MEGA fallback: upload everything if no videos detected
+        if not files and MEGA_RE.search(url):
+            files = collect_all_files(DOWNLOAD_DIR)
+
         if not files:
-            raise Exception("No videos found")
+            raise Exception("No downloadable files found")
 
         await status.edit(f"📦 Uploading {len(files)} file(s)...")
 
         for f in files:
-            fixed, thumb = faststart_and_thumb(f)
+            if not os.path.isfile(f):
+                continue
 
-            parts = (
-                [fixed]
-                if os.path.getsize(fixed) < SPLIT_SIZE
-                else split_file(fixed)
-            )
+            if f.lower().endswith(tuple(e.lower() for e in VIDEO_EXT)):
+                fixed, thumb = faststart_and_thumb(f)
+                parts = [fixed] if os.path.getsize(fixed) < SPLIT_SIZE else split_file(fixed)
 
-            for p in parts:
-                await app.send_video(
-                    "me",
-                    video=p,
-                    thumb=thumb,
-                    supports_streaming=True,
-                    caption=os.path.basename(p),
-                )
-                os.remove(p)
+                for p in parts:
+                    await app.send_video(
+                        "me",
+                        video=p,
+                        thumb=thumb,
+                        supports_streaming=True,
+                        caption=os.path.basename(p),
+                    )
+                    os.remove(p)
 
-            if os.path.exists(thumb):
-                os.remove(thumb)
+                if os.path.exists(thumb):
+                    os.remove(thumb)
+            else:
+                await app.send_document("me", document=f)
+                os.remove(f)
 
         await status.edit("✅ Done")
 
