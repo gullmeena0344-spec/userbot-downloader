@@ -3,7 +3,7 @@ import re
 import asyncio
 import time
 import shutil
-from urllib.parse import urlparse
+from pathlib import Path
 
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
@@ -16,12 +16,10 @@ API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
 if not API_ID or not API_HASH or not SESSION_STRING:
-    raise RuntimeError("Missing API_ID / API_HASH / SESSION_STRING env variables")
+    raise RuntimeError("Missing API_ID / API_HASH / SESSION_STRING")
 
-DOWNLOAD_DIR = "downloads"
-COOKIES_FILE = "cookies.txt"
-
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+DOWNLOAD_DIR = Path("downloads")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # =========================================
 
@@ -42,11 +40,11 @@ async def safe_edit(msg: Message, text: str):
 
 # ================= yt-dlp =================
 
-async def download_ytdlp(url: str, status: Message) -> str:
-    output = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
+async def download_ytdlp(url: str, status: Message) -> Path:
+    output = str(DOWNLOAD_DIR / "%(title).80s.%(ext)s")
 
     attempts = [
-        # 1️⃣ normal
+        # 1️⃣ Normal (mp4 preferred)
         [
             "yt-dlp",
             "-f", "bv*+ba/b",
@@ -56,7 +54,7 @@ async def download_ytdlp(url: str, status: Message) -> str:
             url
         ],
 
-        # 2️⃣ HLS safe
+        # 2️⃣ HLS safe (avoids separator errors)
         [
             "yt-dlp",
             "--downloader", "ffmpeg",
@@ -68,10 +66,10 @@ async def download_ytdlp(url: str, status: Message) -> str:
             url
         ],
 
-        # 3️⃣ last resort
+        # 3️⃣ Last resort (whatever works)
         [
             "yt-dlp",
-            "--remux-video", "mp4",
+            "--no-playlist",
             "-o", output,
             url
         ]
@@ -99,9 +97,11 @@ async def download_ytdlp(url: str, status: Message) -> str:
         code = await proc.wait()
         if code == 0:
             files = sorted(
-                [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR)],
-                key=os.path.getmtime
+                DOWNLOAD_DIR.glob("*"),
+                key=lambda f: f.stat().st_mtime
             )
+            if not files:
+                raise Exception("Download finished but no file found")
             return files[-1]
 
         last_error = f"Attempt {idx} failed"
@@ -111,20 +111,20 @@ async def download_ytdlp(url: str, status: Message) -> str:
 
 # ================= Upload =================
 
-async def upload_file(app: Client, msg: Message, path: str):
-    size = os.path.getsize(path)
+async def upload_file(app: Client, msg: Message, path: Path):
+    total = path.stat().st_size
 
-    async def progress(current, total):
-        percent = current * 100 / total
+    async def progress(current, total_bytes):
+        percent = current * 100 / total_bytes
         await safe_edit(
             msg,
             f"⬆️ Uploading… {percent:.1f}%\n"
-            f"{current/1024/1024:.1f}MB / {total/1024/1024:.1f}MB"
+            f"{current/1024/1024:.1f} MB / {total_bytes/1024/1024:.1f} MB"
         )
 
     await app.send_document(
-        msg.chat.id,
-        path,
+        chat_id=msg.chat.id,
+        document=str(path),
         progress=progress
     )
 
@@ -132,13 +132,14 @@ async def upload_file(app: Client, msg: Message, path: str):
 # ================= CLIENT =================
 
 app = Client(
-    session_string=SESSION_STRING,
+    "userbot",
     api_id=API_ID,
-    api_hash=API_HASH
+    api_hash=API_HASH,
+    session_string=SESSION_STRING
 )
 
 
-# ================= Handler =================
+# ================= HANDLER =================
 
 @app.on_message(filters.private & filters.text)
 async def handler(client: Client, message: Message):
@@ -156,8 +157,8 @@ async def handler(client: Client, message: Message):
         await safe_edit(status, f"❌ Error:\n{e}")
     finally:
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 
-print("✅ Userbot started (session string)")
+print("✅ Userbot started (stable)")
 app.run()
