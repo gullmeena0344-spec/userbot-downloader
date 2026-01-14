@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import requests
 import base64
-import json
+import time
 from urllib.parse import urlparse
 
 from pyrogram import Client, filters
@@ -54,13 +54,13 @@ app = Client(
 # ================= HELPERS =================
 
 def collect_files(root):
-    files = []
+    out = []
     for b, _, names in os.walk(root):
         for n in names:
             p = os.path.join(b, n)
             if p.lower().endswith(ALLOWED_EXT):
-                files.append(p)
-    return files
+                out.append(p)
+    return out
 
 # ================= PIXELDRAIN =================
 
@@ -77,41 +77,67 @@ def download_pixeldrain(fid, path):
             if c:
                 f.write(c)
 
-# ================= GOFILE (PUBLIC BYPASS) =================
+# ================= GOFILE (AUTO RETRY) =================
+
+GOFILE_WT_LIST = [
+    "4fd6sg89d7s6",
+    "d7f7s6f9d8s7",
+    "a8f7d6s9f8d7",
+]
 
 def download_gofile_public(folder_id):
-    page = requests.get(
-        f"https://gofile.io/d/{folder_id}",
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=30,
-    )
-    page.raise_for_status()
+    last_error = None
 
-    # Extract embedded JSON
-    m = re.search(r"window\.__INITIAL_STATE__\s*=\s*({.*?});", page.text)
-    if not m:
-        raise Exception("Failed to parse GoFile page")
+    for wt in GOFILE_WT_LIST:
+        try:
+            r = requests.get(
+                f"https://api.gofile.io/contents/{folder_id}",
+                params={"wt": wt, "cache": "true"},
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "application/json",
+                    "Referer": "https://gofile.io/",
+                    "Origin": "https://gofile.io",
+                },
+                timeout=30,
+            )
 
-    data = json.loads(m.group(1))
-    contents = data["content"]["children"]
+            if r.status_code == 401:
+                raise Exception("401 Unauthorized")
 
-    for f in contents.values():
-        if f["type"] != "file":
-            continue
-
-        name = f["name"]
-        if not name.lower().endswith(ALLOWED_EXT):
-            continue
-
-        url = f["link"]
-        path = os.path.join(DOWNLOAD_DIR, name)
-
-        with requests.get(url, stream=True) as r:
             r.raise_for_status()
-            with open(path, "wb") as o:
-                for c in r.iter_content(1024 * 1024):
-                    if c:
-                        o.write(c)
+            data = r.json()
+
+            if data.get("status") != "ok":
+                raise Exception("Invalid GoFile response")
+
+            contents = data["data"]["contents"]
+
+            for f in contents.values():
+                if f.get("type") != "file":
+                    continue
+
+                name = f["name"]
+                if not name.lower().endswith(ALLOWED_EXT):
+                    continue
+
+                path = os.path.join(DOWNLOAD_DIR, name)
+                url = f["link"]
+
+                with requests.get(url, stream=True) as d:
+                    d.raise_for_status()
+                    with open(path, "wb") as o:
+                        for chunk in d.iter_content(1024 * 1024):
+                            if chunk:
+                                o.write(chunk)
+
+            return  # ✅ SUCCESS
+
+        except Exception as e:
+            last_error = e
+            time.sleep(2)
+
+    raise Exception(f"GoFile failed after retries: {last_error}")
 
 # ================= MEGA =================
 
@@ -201,7 +227,7 @@ async def handler(_, m: Message):
             download_pixeldrain(px.group(1), os.path.join(DOWNLOAD_DIR, info["name"]))
 
         elif (gf := GOFILE_RE.search(text)):
-            await status.edit("⬇️ GoFile...")
+            await status.edit("⬇️ GoFile (retry enabled)...")
             download_gofile_public(gf.group(1))
 
         elif MEGA_RE.search(text):
