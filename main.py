@@ -8,19 +8,26 @@ import subprocess
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-# ================== CONFIG ==================
+# ================= CONFIG =================
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = "downloads"
-SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9 GB safe split
+SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
 GOFILE_RE = re.compile(r"https?://gofile\.io/d/([A-Za-z0-9]+)")
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept": "application/json",
+    "Referer": "https://gofile.io/",
+    "Origin": "https://gofile.io",
+}
 
 app = Client(
     "userbot",
@@ -29,18 +36,18 @@ app = Client(
     session_string=SESSION_STRING,
 )
 
-# ================== HELPERS ==================
+# ================= HELPERS =================
 
 def human(size):
-    for unit in ["B", "KB", "MB", "GB"]:
+    for u in ["B", "KB", "MB", "GB"]:
         if size < 1024:
-            return f"{size:.2f}{unit}"
+            return f"{size:.2f}{u}"
         size /= 1024
     return f"{size:.2f}TB"
 
 
 def download_with_progress(url, path, msg):
-    r = requests.get(url, stream=True)
+    r = requests.get(url, stream=True, headers=HEADERS)
     r.raise_for_status()
     total = int(r.headers.get("content-length", 0))
     done = 0
@@ -53,9 +60,9 @@ def download_with_progress(url, path, msg):
                 done += len(chunk)
 
                 if time.time() - last > 2:
-                    percent = (done / total) * 100 if total else 0
+                    pct = (done / total * 100) if total else 0
                     msg.edit_text(
-                        f"📥 Downloading\n{percent:.1f}% | {human(done)}/{human(total)}"
+                        f"📥 Downloading\n{pct:.1f}% | {human(done)}/{human(total)}"
                     )
                     last = time.time()
 
@@ -70,10 +77,10 @@ def convert_to_mp4(src):
     return dst
 
 
-def extract_thumbnail(video_path):
-    thumb = video_path + ".jpg"
+def extract_thumbnail(video):
+    thumb = video + ".jpg"
     subprocess.run(
-        ["ffmpeg", "-y", "-i", video_path, "-ss", "00:00:01", "-vframes", "1", thumb],
+        ["ffmpeg", "-y", "-i", video, "-ss", "00:00:01", "-vframes", "1", thumb],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -87,33 +94,54 @@ def split_file(path):
 
     with open(path, "rb") as f:
         for i in range(count):
-            part_path = f"{path}.part{i+1}.mp4"
-            with open(part_path, "wb") as p:
+            part = f"{path}.part{i+1}.mp4"
+            with open(part, "wb") as p:
                 p.write(f.read(SPLIT_SIZE))
-            parts.append(part_path)
+            parts.append(part)
 
     os.remove(path)
     return parts
 
 
 def get_gofile_files(content_id):
-    server = requests.get("https://api.gofile.io/getServer").json()["data"]["server"]
+    # Step 1: get server
+    r = requests.get(
+        "https://api.gofile.io/getServer",
+        headers=HEADERS,
+        timeout=15
+    )
+    r.raise_for_status()
+    server = r.json()["data"]["server"]
+
+    # Step 2: get content
     r = requests.get(
         f"https://{server}.gofile.io/getContent",
+        headers=HEADERS,
         params={"contentId": content_id, "details": "true"},
+        timeout=20
     )
+
+    if not r.text.strip().startswith("{"):
+        raise Exception("Gofile blocked request (HTML/empty response)")
+
     data = r.json()
+    if data.get("status") != "ok":
+        raise Exception("Gofile API error")
 
     files = []
     for f in data["data"]["contents"].values():
-        if f["type"] == "file":
+        if f.get("type") == "file":
             files.append({
                 "name": f["name"],
                 "url": f["link"],
             })
+
+    if not files:
+        raise Exception("No files found in Gofile folder")
+
     return files
 
-# ================== BOT ==================
+# ================= BOT =================
 
 @app.on_message(filters.private & filters.text)
 async def handler(client: Client, message: Message):
@@ -144,26 +172,26 @@ async def handler(client: Client, message: Message):
             files = get_gofile_files(cid)
 
         for item in files:
-            filename = item["name"]
-            filepath = os.path.join(DOWNLOAD_DIR, filename)
+            name = item["name"]
+            path = os.path.join(DOWNLOAD_DIR, name)
 
-            await status.edit(f"📥 Downloading\n{filename}")
-            download_with_progress(item["url"], filepath, status)
+            await status.edit_text(f"📥 Downloading\n{name}")
+            download_with_progress(item["url"], path, status)
 
-            if not filepath.lower().endswith(".mp4"):
-                await status.edit("🎬 Converting to MP4")
-                new_path = convert_to_mp4(filepath)
-                os.remove(filepath)
-                filepath = new_path
+            if not path.lower().endswith(".mp4"):
+                await status.edit_text("🎬 Converting to MP4")
+                new = convert_to_mp4(path)
+                os.remove(path)
+                path = new
 
             parts = (
-                split_file(filepath)
-                if os.path.getsize(filepath) > SPLIT_SIZE
-                else [filepath]
+                split_file(path)
+                if os.path.getsize(path) > SPLIT_SIZE
+                else [path]
             )
 
             for i, part in enumerate(parts, 1):
-                await status.edit(f"📤 Uploading part {i}/{len(parts)}")
+                await status.edit_text(f"📤 Uploading part {i}/{len(parts)}")
                 thumb = extract_thumbnail(part)
 
                 await message.reply_video(
@@ -176,10 +204,10 @@ async def handler(client: Client, message: Message):
                 os.remove(thumb)
                 os.remove(part)
 
-        await status.edit("✅ Done & cleaned")
+        await status.edit_text("✅ Done & cleaned")
 
     except Exception as e:
-        await status.edit(f"❌ Error:\n`{e}`")
+        await status.edit_text(f"❌ Error:\n`{e}`")
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
