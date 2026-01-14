@@ -16,7 +16,7 @@ API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = "downloads"
-SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB
+SPLIT_SIZE = 1900 * 1024 * 1024
 COOKIES_FILE = "cookies.txt"
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -27,12 +27,8 @@ BUNKR_RE = re.compile(r"https?://(www\.)?bunkr\.(cr|pk|fi|ru)/")
 # ================= COOKIES =================
 
 def ensure_cookies():
-    """
-    Create cookies.txt from base64 ENV if not present
-    """
     if os.path.exists(COOKIES_FILE):
         return
-
     data = os.getenv("COOKIES_B64")
     if data:
         with open(COOKIES_FILE, "wb") as f:
@@ -59,31 +55,20 @@ def is_direct_video(url):
 def is_hls(url):
     return ".m3u8" in url.lower()
 
-def download_direct(url, path):
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "*/*",
-        "Referer": url
-    }
+# ---------- ARIA2 DIRECT ----------
+def download_aria2(url, out):
+    cmd = [
+        "aria2c",
+        "-x", "8",
+        "-s", "8",
+        "-k", "1M",
+        "--file-allocation=trunc",
+        "-o", out,
+        url
+    ]
+    subprocess.run(cmd, check=True)
 
-    try:
-        r = requests.get(
-            url,
-            headers=headers,
-            stream=True,
-            timeout=(5, 10)
-        )
-    except requests.exceptions.ReadTimeout:
-        raise Exception("CDN blocked Railway IP (timeout).")
-
-    if r.status_code != 200:
-        raise Exception(f"Direct download blocked ({r.status_code})")
-
-    with open(path, "wb") as f:
-        for chunk in r.iter_content(1024 * 1024):
-            if chunk:
-                f.write(chunk)
-
+# ---------- PIXELDRAIN ----------
 def download_pixeldrain(fid, path):
     r = requests.get(f"https://pixeldrain.com/api/file/{fid}", stream=True)
     r.raise_for_status()
@@ -92,6 +77,7 @@ def download_pixeldrain(fid, path):
             if c:
                 f.write(c)
 
+# ---------- YT-DLP + ARIA2 ----------
 def download_ytdlp(url, out):
     parsed = urlparse(url)
     referer = f"{parsed.scheme}://{parsed.netloc}/"
@@ -100,17 +86,18 @@ def download_ytdlp(url, out):
         "yt-dlp",
         "--no-playlist",
         "--cookies", COOKIES_FILE,
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "--downloader", "aria2c",
+        "--downloader-args", "aria2c:-x 8 -s 8 -k 1M",
+        "--user-agent", "Mozilla/5.0",
         "--add-header", f"Referer:{referer}",
         "--add-header", f"Origin:{referer}",
-        "--hls-use-mpegts",
         "--merge-output-format", "mp4",
         "-o", out,
         url
     ]
-
     subprocess.run(cmd, check=True)
 
+# ---------- CONVERT ----------
 def convert_mp4(src):
     dst = src.rsplit(".", 1)[0] + ".mp4"
     subprocess.run(
@@ -121,6 +108,7 @@ def convert_mp4(src):
     os.remove(src)
     return dst
 
+# ---------- SPLIT ----------
 def split_file(path):
     parts = []
     size = os.path.getsize(path)
@@ -141,10 +129,19 @@ def split_file(path):
 @app.on_message(filters.private & filters.text)
 async def handler(_, m: Message):
     url = m.text.strip()
-    status = await m.reply("🔍 Detecting link type...")
+    status = await m.reply("🔍 Detecting link...")
 
     try:
         files = []
+
+        # ❌ BUNKR BLOCK
+        if BUNKR_RE.search(url):
+            await status.edit(
+                "❌ **Bunkr blocked**\n"
+                "This site blocks Railway IPs.\n"
+                "Run bot locally to download bunkr."
+            )
+            return
 
         # PIXELDRAIN
         px = PIXELDRAIN_RE.search(url)
@@ -155,41 +152,21 @@ async def handler(_, m: Message):
             ).json()
 
             path = os.path.join(DOWNLOAD_DIR, info["name"])
-            await status.edit("⬇️ Downloading from Pixeldrain...")
+            await status.edit("⬇️ Pixeldrain downloading...")
             download_pixeldrain(fid, path)
             files.append(path)
 
-        # BUNKR / WEB PAGE
-        elif BUNKR_RE.search(url):
-            await status.edit("🎥 Extracting via yt-dlp...")
-            out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
-            download_ytdlp(url, out)
-            files.extend(
-                os.path.join(DOWNLOAD_DIR, f)
-                for f in os.listdir(DOWNLOAD_DIR)
-            )
-
-        # DIRECT VIDEO
+        # DIRECT MP4
         elif is_direct_video(url):
-            filename = url.split("/")[-1].split("?")[0]
-            path = os.path.join(DOWNLOAD_DIR, filename)
-            await status.edit("⬇️ Downloading direct video...")
-            download_direct(url, path)
+            name = url.split("/")[-1].split("?")[0]
+            path = os.path.join(DOWNLOAD_DIR, name)
+            await status.edit("⚡ Direct download (aria2)...")
+            download_aria2(url, path)
             files.append(path)
 
-        # HLS
-        elif is_hls(url):
-            await status.edit("📡 Downloading HLS stream...")
-            out = os.path.join(DOWNLOAD_DIR, "video.%(ext)s")
-            download_ytdlp(url, out)
-            files.extend(
-                os.path.join(DOWNLOAD_DIR, f)
-                for f in os.listdir(DOWNLOAD_DIR)
-            )
-
-        # OTHER SITES
+        # HLS / OTHER
         else:
-            await status.edit("🎥 Extracting via yt-dlp...")
+            await status.edit("🎥 Extracting video...")
             out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
             download_ytdlp(url, out)
             files.extend(
@@ -217,7 +194,7 @@ async def handler(_, m: Message):
                 )
                 os.remove(p)
 
-        await status.edit("✅ Done & cleaned")
+        await status.edit("✅ Done")
 
     except Exception as e:
         await status.edit(f"❌ Error:\n`{e}`")
