@@ -22,6 +22,7 @@ COOKIES_FILE = "cookies.txt"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
+MEGA_RE = re.compile(r"https?://mega\.nz/")
 BUNKR_RE = re.compile(r"https?://(www\.)?bunkr\.(cr|pk|fi|ru)/")
 
 # ================= COOKIES =================
@@ -55,18 +56,31 @@ def is_direct_video(url):
 def is_hls(url):
     return ".m3u8" in url.lower()
 
-# ---------- ARIA2 DIRECT ----------
+# ---------- ARIA2 ----------
 def download_aria2(url, out):
     cmd = [
         "aria2c",
-        "-x", "8",
-        "-s", "8",
+        "-x", "1",
+        "-s", "1",
         "-k", "1M",
+        "--timeout=20",
+        "--connect-timeout=20",
         "--file-allocation=trunc",
+        "--header=User-Agent: Mozilla/5.0",
+        "--header=Accept:*/*",
         "-o", out,
         url
     ]
     subprocess.run(cmd, check=True)
+
+# ---------- DIRECT FALLBACK ----------
+def download_direct(url, path):
+    r = requests.get(url, stream=True, timeout=(10, 30))
+    r.raise_for_status()
+    with open(path, "wb") as f:
+        for c in r.iter_content(1024 * 1024):
+            if c:
+                f.write(c)
 
 # ---------- PIXELDRAIN ----------
 def download_pixeldrain(fid, path):
@@ -77,7 +91,16 @@ def download_pixeldrain(fid, path):
             if c:
                 f.write(c)
 
-# ---------- YT-DLP + ARIA2 ----------
+# ---------- MEGA ----------
+def download_mega(url):
+    cmd = [
+        "megadl",
+        "--path", DOWNLOAD_DIR,
+        url
+    ]
+    subprocess.run(cmd, check=True)
+
+# ---------- YT-DLP ----------
 def download_ytdlp(url, out):
     parsed = urlparse(url)
     referer = f"{parsed.scheme}://{parsed.netloc}/"
@@ -87,7 +110,7 @@ def download_ytdlp(url, out):
         "--no-playlist",
         "--cookies", COOKIES_FILE,
         "--downloader", "aria2c",
-        "--downloader-args", "aria2c:-x 8 -s 8 -k 1M",
+        "--downloader-args", "aria2c:-x 1 -s 1 -k 1M",
         "--user-agent", "Mozilla/5.0",
         "--add-header", f"Referer:{referer}",
         "--add-header", f"Origin:{referer}",
@@ -129,28 +152,34 @@ def split_file(path):
 @app.on_message(filters.private & filters.text)
 async def handler(_, m: Message):
     url = m.text.strip()
-    status = await m.reply("🔍 Detecting link...")
+    status = await m.reply("🔍 Processing link...")
 
     try:
         files = []
 
-        # ❌ BUNKR BLOCK
+        # ❌ BUNKR
         if BUNKR_RE.search(url):
             await status.edit(
-                "❌ **Bunkr blocked**\n"
-                "This site blocks Railway IPs.\n"
+                "❌ **Bunkr blocked on Railway**\n"
                 "Run bot locally to download bunkr."
             )
             return
 
+        # MEGA
+        if MEGA_RE.search(url):
+            await status.edit("⬇️ Downloading from MEGA...")
+            download_mega(url)
+            files.extend(
+                os.path.join(DOWNLOAD_DIR, f)
+                for f in os.listdir(DOWNLOAD_DIR)
+            )
+
         # PIXELDRAIN
-        px = PIXELDRAIN_RE.search(url)
-        if px:
+        elif (px := PIXELDRAIN_RE.search(url)):
             fid = px.group(1)
             info = requests.get(
                 f"https://pixeldrain.com/api/file/{fid}/info"
             ).json()
-
             path = os.path.join(DOWNLOAD_DIR, info["name"])
             await status.edit("⬇️ Pixeldrain downloading...")
             download_pixeldrain(fid, path)
@@ -160,8 +189,11 @@ async def handler(_, m: Message):
         elif is_direct_video(url):
             name = url.split("/")[-1].split("?")[0]
             path = os.path.join(DOWNLOAD_DIR, name)
-            await status.edit("⚡ Direct download (aria2)...")
-            download_aria2(url, path)
+            await status.edit("⚡ Direct download...")
+            try:
+                download_aria2(url, path)
+            except Exception:
+                download_direct(url, path)
             files.append(path)
 
         # HLS / OTHER
@@ -194,7 +226,7 @@ async def handler(_, m: Message):
                 )
                 os.remove(p)
 
-        await status.edit("✅ Done")
+        await status.edit("✅ Done & cleaned")
 
     except Exception as e:
         await status.edit(f"❌ Error:\n`{e}`")
