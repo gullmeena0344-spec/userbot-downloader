@@ -3,6 +3,7 @@ import re
 import asyncio
 import time
 import shutil
+import subprocess
 from pathlib import Path
 
 from pyrogram import Client, filters
@@ -40,79 +41,62 @@ async def safe_edit(msg: Message, text: str):
 
 # ================= yt-dlp =================
 
-async def download_ytdlp(url: str, status: Message) -> Path:
+async def download_ytdlp(url: str, status: Message):
     output = str(DOWNLOAD_DIR / "%(title).80s.%(ext)s")
 
-    attempts = [
-        # 1️⃣ Normal (mp4 preferred)
-        [
-            "yt-dlp",
-            "-f", "bv*+ba/b",
-            "--merge-output-format", "mp4",
-            "--no-playlist",
-            "-o", output,
-            url
-        ],
-
-        # 2️⃣ HLS safe (avoids separator errors)
-        [
-            "yt-dlp",
-            "--downloader", "ffmpeg",
-            "--hls-use-mpegts",
-            "--no-hls-rewrite",
-            "--no-part",
-            "-f", "best",
-            "-o", output,
-            url
-        ],
-
-        # 3️⃣ Last resort (whatever works)
-        [
-            "yt-dlp",
-            "--no-playlist",
-            "-o", output,
-            url
-        ]
+    cmd = [
+        "yt-dlp",
+        "-f", "bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "--no-playlist",
+        "--write-thumbnail",
+        "--convert-thumbnails", "jpg",
+        "--downloader", "ffmpeg",
+        "--hls-use-mpegts",
+        "--no-hls-rewrite",
+        "-o", output,
+        url
     ]
 
-    last_error = None
+    await safe_edit(status, "⬇️ Downloading…")
 
-    for idx, cmd in enumerate(attempts, start=1):
-        await safe_edit(status, f"⬇️ Downloading (try {idx}/3)…")
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT
+    )
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT
-        )
+    last_update = 0
+    async for line in proc.stdout:
+        line = line.decode(errors="ignore").strip()
+        if "[download]" in line and "%" in line:
+            if time.time() - last_update > 2:
+                await safe_edit(status, f"⬇️ {line}")
+                last_update = time.time()
 
-        last_update = 0
-        async for line in proc.stdout:
-            line = line.decode(errors="ignore").strip()
-            if "[download]" in line and "%" in line:
-                if time.time() - last_update > 2:
-                    await safe_edit(status, f"⬇️ {line}")
-                    last_update = time.time()
+    code = await proc.wait()
+    if code != 0:
+        raise Exception("yt-dlp failed")
 
-        code = await proc.wait()
-        if code == 0:
-            files = sorted(
-                DOWNLOAD_DIR.glob("*"),
-                key=lambda f: f.stat().st_mtime
-            )
-            if not files:
-                raise Exception("Download finished but no file found")
-            return files[-1]
+    video = None
+    thumb = None
 
-        last_error = f"Attempt {idx} failed"
+    for f in DOWNLOAD_DIR.iterdir():
+        if f.suffix == ".mp4":
+            video = f
+        elif f.suffix == ".jpg":
+            thumb = f
 
-    raise Exception(f"yt-dlp failed\n{last_error}")
+    if not video:
+        raise Exception("No video file found")
+
+    return video, thumb
 
 
 # ================= Upload =================
 
-async def upload_file(app: Client, msg: Message, path: Path):
-    total = path.stat().st_size
+async def upload_video(app: Client, msg: Message, video: Path, thumb: Path | None):
+    total = video.stat().st_size
 
     async def progress(current, total_bytes):
         percent = current * 100 / total_bytes
@@ -122,9 +106,11 @@ async def upload_file(app: Client, msg: Message, path: Path):
             f"{current/1024/1024:.1f} MB / {total_bytes/1024/1024:.1f} MB"
         )
 
-    await app.send_document(
+    await app.send_video(
         chat_id=msg.chat.id,
-        document=str(path),
+        video=str(video),
+        thumb=str(thumb) if thumb and thumb.exists() else None,
+        supports_streaming=True,
         progress=progress
     )
 
@@ -150,8 +136,8 @@ async def handler(client: Client, message: Message):
     status = await message.reply("⏳ Processing…")
 
     try:
-        file_path = await download_ytdlp(url, status)
-        await upload_file(client, status, file_path)
+        video, thumb = await download_ytdlp(url, status)
+        await upload_video(client, status, video, thumb)
         await safe_edit(status, "✅ Done")
     except Exception as e:
         await safe_edit(status, f"❌ Error:\n{e}")
@@ -160,5 +146,5 @@ async def handler(client: Client, message: Message):
         DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 
-print("✅ Userbot started (stable)")
+print("✅ Userbot started (STREAMING MODE)")
 app.run()
