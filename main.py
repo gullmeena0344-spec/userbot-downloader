@@ -8,14 +8,14 @@ import subprocess
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-# ================= CONFIG =================
+# =============== CONFIG ==================
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = "downloads"
-SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB safe split
+SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -29,7 +29,7 @@ app = Client(
     session_string=SESSION_STRING,
 )
 
-# ================= HELPERS =================
+# =============== HELPERS ==================
 
 def human(size):
     for unit in ["B", "KB", "MB", "GB"]:
@@ -70,21 +70,8 @@ def convert_to_mp4(src):
     return dst
 
 
-def get_video_info(path):
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path
-    ]
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    w, h, d = p.stdout.strip().split("\n")
-    return int(float(w)), int(float(h)), int(float(d))
-
-
 def extract_thumbnail(video_path):
-    thumb = video_path.rsplit(".", 1)[0] + ".jpg"
+    thumb = video_path + ".jpg"
     subprocess.run(
         [
             "ffmpeg", "-y",
@@ -106,101 +93,14 @@ def split_file(path):
 
     with open(path, "rb") as f:
         for i in range(count):
-            part_path = f"{path}.part{i+1}"
-            with open(part_path, "wb") as p:
+            part = f"{path}.part{i+1}"
+            with open(part, "wb") as p:
                 p.write(f.read(SPLIT_SIZE))
-            parts.append(part_path)
+            parts.append(part)
 
     os.remove(path)
     return parts
 
-# ================= BOT =================
+# =============== BOT ==================
 
-@app.on_message(filters.private & filters.text)
-async def handler(client: Client, message: Message):
-    text = message.text.strip()
-
-    px = PIXELDRAIN_RE.search(text)
-    gf = GOFILE_RE.search(text)
-
-    if not px and not gf:
-        return
-
-    status = await message.reply("🔍 Fetching info...")
-
-    try:
-        files = []
-
-        if px:
-            fid = px.group(1)
-            info = requests.get(
-                f"https://pixeldrain.com/api/file/{fid}/info"
-            ).json()
-            files.append({
-                "name": info["name"],
-                "url": f"https://pixeldrain.com/api/file/{fid}",
-            })
-
-        else:
-            cid = gf.group(1)
-            data = requests.get(
-                f"https://api.gofile.io/getContent?contentId={cid}"
-            ).json()
-            for f in data["data"]["contents"].values():
-                if f["type"] == "file":
-                    files.append({
-                        "name": f["name"],
-                        "url": f["link"],
-                    })
-
-        for item in files:
-            filename = item["name"]
-            filepath = os.path.join(DOWNLOAD_DIR, filename)
-
-            await status.edit(f"📥 Downloading\n{filename}")
-            download_with_progress(item["url"], filepath, status)
-
-            if not filepath.lower().endswith(".mp4"):
-                await status.edit("🎬 Converting to MP4")
-                new_path = convert_to_mp4(filepath)
-                os.remove(filepath)
-                filepath = new_path
-
-            size = os.path.getsize(filepath)
-
-            if size > SPLIT_SIZE:
-                await status.edit("✂️ Splitting large file")
-                parts = split_file(filepath)
-            else:
-                parts = [filepath]
-
-            for idx, part in enumerate(parts, start=1):
-                await status.edit(f"📤 Uploading part {idx}/{len(parts)}")
-
-                width, height, duration = get_video_info(part)
-                thumb = extract_thumbnail(part)
-
-                await message.reply_video(
-                    video=part,
-                    thumb=thumb,
-                    width=width,
-                    height=height,
-                    duration=duration,
-                    supports_streaming=True,
-                    caption=os.path.basename(part),
-                    progress=lambda c, t: status.edit_text(
-                        f"📤 Uploading\n{(c/t)*100:.1f}%"
-                    ),
-                )
-
-                os.remove(thumb)
-                os.remove(part)
-
-        await status.edit("✅ Done & cleaned")
-
-    except Exception as e:
-        await status.edit(f"❌ Error:\n`{e}`")
-        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-app.run()
+@app.on_m_
