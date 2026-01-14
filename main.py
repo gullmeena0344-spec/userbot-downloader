@@ -2,8 +2,7 @@ import os
 import re
 import asyncio
 import time
-import math
-import subprocess
+import shutil
 from urllib.parse import urlparse
 
 from pyrogram import Client, filters
@@ -11,167 +10,148 @@ from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
 # ================= CONFIG =================
-
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")
+SESSION = os.getenv("SESSION", "userbot")
 
 DOWNLOAD_DIR = "downloads"
 COOKIES_FILE = "cookies.txt"
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# ================= CLIENT =================
+# =========================================
 
-app = Client(
-    "userbot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING
-)
 
-# ================= UTILITIES =================
+def clean_filename(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]', "_", name)
+
 
 async def safe_edit(msg: Message, text: str):
     try:
         await msg.edit(text)
     except FloodWait as e:
         await asyncio.sleep(e.value)
-    except:
+        await msg.edit(text)
+    except Exception:
         pass
 
 
-def sizeof_fmt(num):
-    for unit in ["B","KB","MB","GB","TB"]:
-        if num < 1024:
-            return f"{num:.2f}{unit}"
-        num /= 1024
+# ================= yt-dlp =================
 
+async def download_ytdlp(url: str, status: Message) -> str:
+    output = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
 
-def progress_bar(done, total):
-    if total == 0:
-        return "▰▰▰▰▰▰▰▰▰▰ 0%"
-    percent = done * 100 / total
-    filled = int(percent / 10)
-    return "▰" * filled + "▱" * (10 - filled) + f" {percent:.1f}%"
+    attempts = [
+        # 1️⃣ normal
+        [
+            "yt-dlp",
+            "-f", "bv*+ba/b",
+            "--merge-output-format", "mp4",
+            "--no-playlist",
+            "-o", output,
+            url
+        ],
 
+        # 2️⃣ HLS safe
+        [
+            "yt-dlp",
+            "--downloader", "ffmpeg",
+            "--hls-use-mpegts",
+            "--no-hls-rewrite",
+            "--no-part",
+            "-f", "best",
+            "-o", output,
+            url
+        ],
 
-# ================= YT-DLP DOWNLOAD =================
-
-async def download_ytdlp(url, status):
-    out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
-
-    parsed = urlparse(url)
-    referer = f"{parsed.scheme}://{parsed.netloc}/"
-
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--cookies", COOKIES_FILE,
-        "--user-agent", "Mozilla/5.0",
-        "--referer", referer,
-
-        # 🔥 FIX FOR cdnsolutions.media / AV1 HLS
-        "--downloader", "ffmpeg",
-        "--hls-use-mpegts",
-        "--hls-prefer-ffmpeg",
-        "--no-hls-rewrite",
-        "--no-part",
-
-        "--merge-output-format", "mp4",
-        "-o", out,
-        url
+        # 3️⃣ last resort
+        [
+            "yt-dlp",
+            "--remux-video", "mp4",
+            "-o", output,
+            url
+        ]
     ]
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT
-    )
+    last_error = None
 
-    last = time.time()
+    for idx, cmd in enumerate(attempts, start=1):
+        await safe_edit(status, f"⬇️ Downloading (try {idx}/3)…")
 
-    async for line in proc.stdout:
-        line = line.decode(errors="ignore")
-        if "[download]" in line and "%" in line:
-            if time.time() - last > 2:
-                await safe_edit(status, f"⬇️ {line.strip()}")
-                last = time.time()
-
-    code = await proc.wait()
-    if code != 0:
-        raise Exception("yt-dlp failed")
-
-    files = sorted(
-        [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR)],
-        key=os.path.getmtime
-    )
-    return files[-1]
-
-
-# ================= THUMBNAIL =================
-
-def generate_thumb(video):
-    thumb = video + ".jpg"
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", video, "-ss", "00:00:01", "-vframes", "1", thumb],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-    return thumb if os.path.exists(thumb) else None
-
-
-# ================= UPLOAD =================
-
-async def upload_video(path, status):
-    size = os.path.getsize(path)
-    thumb = generate_thumb(path)
-
-    sent = 0
-    start = time.time()
-
-    async def progress(current, total):
-        nonlocal sent
-        sent = current
-        speed = current / max(1, time.time() - start)
-        bar = progress_bar(current, total)
-        await safe_edit(
-            status,
-            f"⬆️ Uploading\n{bar}\n{sizeof_fmt(current)} / {sizeof_fmt(total)}\n⚡ {sizeof_fmt(speed)}/s"
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT
         )
 
-    await app.send_video(
-        "me",
+        last_update = 0
+        async for line in proc.stdout:
+            line = line.decode(errors="ignore").strip()
+            if "[download]" in line and "%" in line:
+                if time.time() - last_update > 2:
+                    await safe_edit(status, f"⬇️ {line}")
+                    last_update = time.time()
+
+        code = await proc.wait()
+        if code == 0:
+            files = sorted(
+                [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR)],
+                key=os.path.getmtime
+            )
+            return files[-1]
+
+        last_error = f"Attempt {idx} failed"
+
+    raise Exception(f"yt-dlp failed\n{last_error}")
+
+
+# ================= Upload =================
+
+async def upload_file(app: Client, msg: Message, path: str):
+    size = os.path.getsize(path)
+
+    async def progress(current, total):
+        percent = current * 100 / total
+        await safe_edit(
+            msg,
+            f"⬆️ Uploading… {percent:.1f}%\n"
+            f"{current/1024/1024:.1f}MB / {total/1024/1024:.1f}MB"
+        )
+
+    await app.send_document(
+        msg.chat.id,
         path,
-        thumb=thumb,
         progress=progress
     )
 
-    if thumb:
-        os.remove(thumb)
-    os.remove(path)
 
+# ================= Handler =================
 
-# ================= MESSAGE HANDLER =================
+app = Client(
+    SESSION,
+    api_id=API_ID,
+    api_hash=API_HASH
+)
+
 
 @app.on_message(filters.private & filters.text)
-async def handler(_, message: Message):
+async def handler(client: Client, message: Message):
     url = message.text.strip()
-
     if not url.startswith("http"):
         return
 
-    status = await message.reply("🔍 Processing...")
+    status = await message.reply("⏳ Processing…")
 
     try:
-        video = await download_ytdlp(url, status)
-        await upload_video(video, status)
+        file_path = await download_ytdlp(url, status)
+        await upload_file(client, status, file_path)
         await safe_edit(status, "✅ Done")
     except Exception as e:
         await safe_edit(status, f"❌ Error:\n{e}")
+    finally:
+        shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-
-# ================= START =================
 
 print("Userbot started")
 app.run()
