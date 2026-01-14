@@ -49,11 +49,10 @@ app = Client(
     "userbot",
     api_id=API_ID,
     api_hash=API_HASH,
-    session_string=SESSION_STRING,
-    skip_updates=True
+    session_string=SESSION_STRING
 )
 
-# ================= HELPERS =================
+# ================= SAFE EDIT =================
 
 edit_lock = asyncio.Lock()
 
@@ -66,6 +65,8 @@ async def safe_edit(msg, text):
             await asyncio.sleep(e.value)
         except Exception:
             pass
+
+# ================= HELPERS =================
 
 def collect_files():
     out = []
@@ -131,14 +132,12 @@ def faststart_and_thumb(src):
     fixed = base + "_fixed.mp4"
     thumb = base + ".jpg"
 
-    # Faststart copy
     subprocess.run(
         ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
 
-    # AV1-safe thumbnail (re-encode ONE frame)
     subprocess.run(
         [
             "ffmpeg", "-y",
@@ -192,7 +191,9 @@ async def handler(_, m: Message):
 
         if (px := PIXELDRAIN_RE.search(url)):
             await safe_edit(status, "⬇️ Pixeldrain...")
-            info = requests.get(f"https://pixeldrain.com/api/file/{px.group(1)}/info").json()
+            info = requests.get(
+                f"https://pixeldrain.com/api/file/{px.group(1)}/info"
+            ).json()
             download_pixeldrain(px.group(1), os.path.join(DOWNLOAD_DIR, info["name"]))
 
         elif MEGA_RE.search(url):
@@ -201,7 +202,11 @@ async def handler(_, m: Message):
 
         else:
             await safe_edit(status, "🎥 Downloading video...")
-            await download_ytdlp(url, os.path.join(DOWNLOAD_DIR, "%(title).80s.%(ext)s"), status)
+            await download_ytdlp(
+                url,
+                os.path.join(DOWNLOAD_DIR, "%(title).80s.%(ext)s"),
+                status
+            )
 
         files = collect_files()
         if not files:
