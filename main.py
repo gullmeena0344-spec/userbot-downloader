@@ -28,24 +28,8 @@ app = Client(
 
 # ================= UTILS =================
 
-def get_codecs(path):
-    v = subprocess.check_output([
-        "ffprobe", "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name",
-        "-of", "default=nw=1:nk=1",
-        path
-    ]).decode().strip()
-
-    a = subprocess.check_output([
-        "ffprobe", "-v", "error",
-        "-select_streams", "a:0",
-        "-show_entries", "stream=codec_name",
-        "-of", "default=nw=1:nk=1",
-        path
-    ]).decode().strip()
-
-    return v, a
+def safe_size(path, min_mb=5):
+    return os.path.exists(path) and os.path.getsize(path) > min_mb * 1024 * 1024
 
 
 def generate_thumb(video):
@@ -68,11 +52,13 @@ def generate_thumb(video):
 def process_video(src):
     base = src.rsplit(".", 1)[0]
     remuxed = base + "_remux.mp4"
+    encoded = base + "_encoded.mp4"
 
-    # ---- SAFE REMUX ----
+    # ---------- TRY SAFE REMUX ----------
     subprocess.run(
         [
             "ffmpeg", "-y",
+            "-err_detect", "ignore_err",
             "-i", src,
             "-map", "0",
             "-c", "copy",
@@ -83,28 +69,22 @@ def process_video(src):
         stderr=subprocess.DEVNULL
     )
 
-    if os.path.exists(remuxed) and os.path.getsize(remuxed) > 5 * 1024 * 1024:
-        try:
-            v, a = get_codecs(remuxed)
-            if v == "h264" and a == "aac":
-                os.remove(src)
-                return remuxed
-        except Exception:
-            pass
+    if safe_size(remuxed):
+        os.remove(src)
+        return remuxed
 
-    # ---- FORCE RE-ENCODE ----
-    encoded = base + "_encoded.mp4"
+    # ---------- TRY SAFE RE-ENCODE ----------
     subprocess.run(
         [
             "ffmpeg", "-y",
+            "-err_detect", "ignore_err",
             "-i", src,
-            "-map", "0",
+            "-map", "0:v:0?",
+            "-map", "0:a:0?",
             "-c:v", "libx264",
             "-preset", "fast",
             "-crf", "23",
             "-pix_fmt", "yuv420p",
-            "-profile:v", "main",
-            "-level", "4.0",
             "-c:a", "aac",
             "-b:a", "128k",
             "-movflags", "+faststart",
@@ -114,14 +94,19 @@ def process_video(src):
         stderr=subprocess.DEVNULL
     )
 
-    if not os.path.exists(encoded) or os.path.getsize(encoded) < 5 * 1024 * 1024:
-        raise Exception("FFmpeg encoding failed")
+    if safe_size(encoded):
+        if os.path.exists(remuxed):
+            os.remove(remuxed)
+        os.remove(src)
+        return encoded
 
-    os.remove(src)
+    # ---------- LAST RESORT ----------
     if os.path.exists(remuxed):
         os.remove(remuxed)
+    if os.path.exists(encoded):
+        os.remove(encoded)
 
-    return encoded
+    return src  # never crash, always return something
 
 
 async def yt_download(url):
@@ -147,8 +132,8 @@ async def yt_download(url):
         key=os.path.getmtime,
         reverse=True
     )
-    return files[0] if files else None
 
+    return files[0] if files else None
 
 # ================= HANDLER =================
 
@@ -166,7 +151,7 @@ async def handler(_, msg: Message):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         file = await yt_download(url)
-        if not file:
+        if not file or not os.path.exists(file):
             await status.edit("❌ Download failed")
             return
 
@@ -191,7 +176,6 @@ async def handler(_, msg: Message):
     finally:
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
 
 # ================= RUN =================
 
