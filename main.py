@@ -1,29 +1,24 @@
 import os
 import re
-import time
 import math
 import shutil
-import requests
 import subprocess
+import requests
 from pyrogram import Client, filters
 from pyrogram.types import Message
+
+# ============== CONFIG ==============
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = "downloads"
-SPLIT_SIZE = 1900 * 1024 * 1024
+SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
-GOFILE_RE = re.compile(r"https?://gofile\.io/d/([A-Za-z0-9]+)")
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Referer": "https://gofile.io/",
-}
 
 app = Client(
     "userbot",
@@ -32,33 +27,23 @@ app = Client(
     session_string=SESSION_STRING,
 )
 
-# ================= UTILS =================
+# ============== HELPERS ==============
 
-def download_requests(url, path):
-    r = requests.get(url, stream=True, headers=HEADERS, timeout=20)
+def download_pixeldrain(fid, path):
+    r = requests.get(f"https://pixeldrain.com/api/file/{fid}", stream=True)
     r.raise_for_status()
     with open(path, "wb") as f:
         for c in r.iter_content(1024 * 1024):
             if c:
                 f.write(c)
 
-def download_ytdlp(url, path):
+def download_ytdlp(url, out_path):
     cmd = [
         "yt-dlp",
+        "--no-playlist",
         "-f", "bv*+ba/b",
         "--merge-output-format", "mp4",
-        "-o", path,
-        url
-    ]
-    subprocess.run(cmd, check=True)
-
-def download_aria2(url, path):
-    cmd = [
-        "aria2c",
-        "-x", "8",
-        "-s", "8",
-        "-o", os.path.basename(path),
-        "-d", os.path.dirname(path),
+        "-o", out_path,
         url
     ]
     subprocess.run(cmd, check=True)
@@ -85,77 +70,63 @@ def split_file(path):
     os.remove(path)
     return parts
 
-def get_gofile_files(cid):
-    r = requests.get(
-        f"https://api.gofile.io/contents/{cid}",
-        headers=HEADERS,
-        timeout=15
-    )
-    if not r.text.startswith("{"):
-        raise Exception("API blocked")
-    data = r.json()
-    if data.get("status") != "ok":
-        raise Exception("API restricted")
-    return [
-        {"name": f["name"], "url": f["link"]}
-        for f in data["data"]["children"].values()
-        if f["type"] == "file"
-    ]
-
-# ================= BOT =================
+# ============== BOT ==============
 
 @app.on_message(filters.private & filters.text)
 async def handler(_, m: Message):
-    text = m.text.strip()
-    px = PIXELDRAIN_RE.search(text)
-    gf = GOFILE_RE.search(text)
-
-    if not px and not gf:
-        return
-
-    status = await m.reply("🔍 Processing...")
+    url = m.text.strip()
+    status = await m.reply("🔍 Processing link...")
 
     try:
         files = []
 
+        # PIXELDRAIN
+        px = PIXELDRAIN_RE.search(url)
         if px:
             fid = px.group(1)
-            info = requests.get(f"https://pixeldrain.com/api/file/{fid}/info").json()
-            files = [{
-                "name": info["name"],
-                "url": f"https://pixeldrain.com/api/file/{fid}"
-            }]
+            info = requests.get(
+                f"https://pixeldrain.com/api/file/{fid}/info"
+            ).json()
+
+            path = os.path.join(DOWNLOAD_DIR, info["name"])
+            await status.edit("⬇️ Downloading from Pixeldrain")
+            download_pixeldrain(fid, path)
+            files.append(path)
+
+        # ANY OTHER URL (mp4 / m3u8 / streaming)
         else:
-            files = get_gofile_files(gf.group(1))
+            await status.edit("🎥 Extracting video via yt-dlp")
+            out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
+            download_ytdlp(url, out)
 
+            for f in os.listdir(DOWNLOAD_DIR):
+                files.append(os.path.join(DOWNLOAD_DIR, f))
+
+        # PROCESS FILES
         for f in files:
-            name = f["name"]
-            path = os.path.join(DOWNLOAD_DIR, name)
-
-            await status.edit("⬇️ Trying direct download…")
-            try:
-                download_requests(f["url"], path)
-            except:
-                await status.edit("⚠️ Direct failed → yt-dlp")
-                try:
-                    download_ytdlp(f["url"], path)
-                except:
-                    await status.edit("⚠️ yt-dlp failed → aria2")
-                    download_aria2(f["url"], path)
+            path = f
 
             if not path.lower().endswith(".mp4"):
                 path = convert_mp4(path)
 
-            parts = [path] if os.path.getsize(path) < SPLIT_SIZE else split_file(path)
+            parts = (
+                [path]
+                if os.path.getsize(path) < SPLIT_SIZE
+                else split_file(path)
+            )
 
             for p in parts:
-                await m.reply_video(p, supports_streaming=True)
+                await m.reply_video(
+                    video=p,
+                    supports_streaming=True,
+                    caption=os.path.basename(p),
+                )
                 os.remove(p)
 
-        await status.edit("✅ Done")
+        await status.edit("✅ Done & cleaned")
 
     except Exception as e:
-        await status.edit(f"❌ Failed:\n`{e}`")
+        await status.edit(f"❌ Error:\n`{e}`")
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
