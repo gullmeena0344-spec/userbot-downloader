@@ -1,11 +1,10 @@
 import os
-import re
 import math
 import shutil
 import subprocess
 import asyncio
 import base64
-import requests
+import time
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -18,7 +17,7 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 
 DOWNLOAD_DIR = "downloads"
 COOKIES_FILE = "cookies.txt"
-SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB
+SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9 GB
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -52,10 +51,12 @@ def collect_files():
         if os.path.isfile(os.path.join(DOWNLOAD_DIR, f))
     ]
 
+# ---------- SAFE FASTSTART ----------
+
 def faststart(src):
     fixed = src.rsplit(".", 1)[0] + "_fixed.mp4"
 
-    result = subprocess.run(
+    subprocess.run(
         [
             "ffmpeg", "-y",
             "-i", src,
@@ -68,67 +69,77 @@ def faststart(src):
         stderr=subprocess.DEVNULL
     )
 
-    # 🔒 IMPORTANT: check if ffmpeg really created the file
     if os.path.exists(fixed) and os.path.getsize(fixed) > 0:
         os.remove(src)
         return fixed
     else:
-        # ffmpeg failed → keep original
         if os.path.exists(fixed):
             os.remove(fixed)
         return src
-        
 
-    return fixed
+# ---------- SAFE MP4 SPLIT (NO BLUE SCREEN) ----------
 
-def split_file(path):
-    parts = []
-    size = os.path.getsize(path)
-    count = math.ceil(size / SPLIT_SIZE)
+def split_mp4_ffmpeg(path):
+    base = path.rsplit(".", 1)[0]
+    out_pattern = f"{base}_part%03d.mp4"
 
-    with open(path, "rb") as f:
-        for i in range(count):
-            part = f"{path}.part{i+1}.mp4"
-            with open(part, "wb") as o:
-                o.write(f.read(SPLIT_SIZE))
-            parts.append(part)
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", path,
+            "-c", "copy",
+            "-map", "0",
+            "-f", "segment",
+            "-segment_time", "1800",   # ~30 min
+            "-reset_timestamps", "1",
+            out_pattern
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
 
-    os.remove(path)
+    parts = sorted(
+        os.path.join(DOWNLOAD_DIR, f)
+        for f in os.listdir(DOWNLOAD_DIR)
+        if f.startswith(os.path.basename(base)) and "_part" in f
+    )
+
+    if parts:
+        os.remove(path)
+
     return parts
 
-# ================= THUMBNAIL =================
+# ---------- THUMBNAIL ----------
 
 def generate_thumb(video):
     thumb = video.rsplit(".", 1)[0] + ".jpg"
+
     subprocess.run(
-        ["ffmpeg", "-y", "-i", video, "-ss", "00:00:01", "-vframes", "1", thumb],
+        [
+            "ffmpeg", "-y",
+            "-ss", "5",
+            "-i", video,
+            "-vframes", "1",
+            "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+            "-q:v", "5",
+            thumb
+        ],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
     )
-    return thumb if os.path.exists(thumb) else None
 
-# ================= ARIA2 =================
+    if os.path.exists(thumb) and os.path.getsize(thumb) < 200 * 1024:
+        return thumb
 
-def aria2_download(url):
-    cmd = [
-        "aria2c",
-        "-x", "8",
-        "-s", "8",
-        "-k", "1M",
-        "--file-allocation=trunc",
-        "-d", DOWNLOAD_DIR,
-        url
-    ]
-    subprocess.run(cmd, check=True)
+    if os.path.exists(thumb):
+        os.remove(thumb)
+    return None
 
-# ================= GOFILE (REALISTIC) =================
+# ================= DOWNLOADERS =================
 
-def is_gofile(url):
-    return "gofile.io" in url
+# ---------- yt-dlp with progress ----------
 
-# ================= YT-DLP (UNCHANGED) =================
-
-async def ytdlp_download(url, status_msg):
+async def ytdlp_download(url, status):
     out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
 
     cmd = [
@@ -141,27 +152,60 @@ async def ytdlp_download(url, status_msg):
         url
     ]
 
-    process = await asyncio.create_subprocess_exec(
+    proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT
     )
 
-    last_edit = 0
+    last = 0
     while True:
-        line = await process.stdout.readline()
+        line = await proc.stdout.readline()
         if not line:
             break
-
         text = line.decode(errors="ignore").strip()
         if "[download]" in text and "%" in text:
-            now = asyncio.get_event_loop().time()
-            if now - last_edit > 1.2:
-                last_edit = now
-                await status_msg.edit(f"⬇️ Downloading\n`{text}`")
+            now = time.time()
+            if now - last > 1.2:
+                last = now
+                await status.edit(f"⬇️ Downloading\n`{text}`")
 
-    if await process.wait() != 0:
+    if await proc.wait() != 0:
         raise Exception("yt-dlp failed")
+
+# ---------- aria2 fallback with progress ----------
+
+async def aria2_download(url, status):
+    cmd = [
+        "aria2c",
+        "--summary-interval=1",
+        "-x", "8",
+        "-s", "8",
+        "-k", "1M",
+        "-d", DOWNLOAD_DIR,
+        url
+    ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT
+    )
+
+    last = 0
+    while True:
+        line = await proc.stdout.readline()
+        if not line:
+            break
+        text = line.decode(errors="ignore").strip()
+        if "%" in text:
+            now = time.time()
+            if now - last > 1.2:
+                last = now
+                await status.edit(f"⬇️ Downloading\n`{text}`")
+
+    if await proc.wait() != 0:
+        raise Exception("aria2 failed")
 
 # ================= HANDLER =================
 
@@ -177,39 +221,58 @@ async def handler(_, m: Message):
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-        # ---- GOFILE → ARIA2 ONLY ----
-        if is_gofile(url):
-            await status.edit("⬇️ Downloading via aria2...")
-            aria2_download(url)
-
-        # ---- EVERYTHING ELSE ----
-        else:
+        # ---------- DOWNLOAD ----------
+        try:
             await ytdlp_download(url, status)
+        except Exception:
+            await aria2_download(url, status)
 
         files = collect_files()
         if not files:
             raise Exception("No files downloaded")
 
-        await status.edit("📦 Processing...")
+        await status.edit("📦 Processing video...")
 
+        # ---------- PROCESS & UPLOAD ----------
         for f in files:
             fixed = faststart(f)
-            thumb = generate_thumb(fixed)
 
-            parts = [fixed] if os.path.getsize(fixed) < SPLIT_SIZE else split_file(fixed)
+            if os.path.getsize(fixed) < SPLIT_SIZE:
+                parts = [fixed]
+            else:
+                parts = split_mp4_ffmpeg(fixed)
 
-            for p in parts:
+            total = len(parts)
+
+            for i, p in enumerate(parts, start=1):
+                thumb = generate_thumb(p)
+                caption = f"{os.path.basename(p)}\n({i}/{total})"
+
+                last = 0
+
+                async def progress(current, total_size):
+                    nonlocal last
+                    now = time.time()
+                    if now - last > 1.2:
+                        last = now
+                        percent = current * 100 / total_size
+                        await status.edit(
+                            f"⬆️ Uploading {i}/{total}\n"
+                            f"{percent:.1f}%"
+                        )
+
                 await app.send_video(
                     "me",
                     video=p,
                     thumb=thumb,
                     supports_streaming=True,
-                    caption=os.path.basename(p)
+                    caption=caption,
+                    progress=progress
                 )
-                os.remove(p)
 
-            if thumb and os.path.exists(thumb):
-                os.remove(thumb)
+                os.remove(p)
+                if thumb and os.path.exists(thumb):
+                    os.remove(thumb)
 
         await status.edit("✅ Done")
 
