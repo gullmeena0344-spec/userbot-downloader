@@ -83,7 +83,6 @@ def split_file(path):
 
 def generate_thumb(video):
     thumb = video.rsplit(".", 1)[0] + ".jpg"
-
     try:
         duration = float(subprocess.check_output([
             "ffprobe", "-v", "error",
@@ -96,38 +95,30 @@ def generate_thumb(video):
         seek = 1
 
     subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-ss", str(seek),
-            "-i", video,
-            "-vframes", "1",
-            "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
-            "-q:v", "5",
-            thumb
-        ],
+        ["ffmpeg", "-y", "-ss", str(seek), "-i", video,
+         "-vframes", "1", "-vf",
+         "scale=320:320:force_original_aspect_ratio=decrease",
+         "-q:v", "5", thumb],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
 
-    if not os.path.exists(thumb):
-        return None
-
-    if os.path.getsize(thumb) > 200 * 1024:
-        os.remove(thumb)
+    if not os.path.exists(thumb) or os.path.getsize(thumb) > 200 * 1024:
+        if os.path.exists(thumb):
+            os.remove(thumb)
         return None
 
     return thumb
 
-# ================= GOFILE (SCRAPING – FREE SAFE) =================
+# ================= GOFILE =================
 
 def is_gofile(url):
     return "gofile.io/d/" in url
 
-def get_gofile_files(url):
+def scrape_gofile(url):
     scraper = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "desktop": True}
     )
-
     r = scraper.get(url, timeout=30)
     if r.status_code != 200:
         raise Exception(f"GoFile HTTP {r.status_code}")
@@ -137,19 +128,50 @@ def get_gofile_files(url):
 
     for script in soup.find_all("script"):
         if script.string and "directLink" in script.string:
-            text = script.string
-            names = re.findall(r'"name":"(.*?)"', text)
-            links = re.findall(r'"directLink":"(https:\\/\\/.*?)"', text)
-
+            names = re.findall(r'"name":"(.*?)"', script.string)
+            links = re.findall(r'"directLink":"(https:\\/\\/.*?)"', script.string)
             for n, l in zip(names, links):
                 files.append((n, l.replace("\\/", "/")))
 
     if not files:
-        raise Exception("No files found (private / password / blocked)")
+        raise Exception("Scrape failed")
 
     return files
 
-# ================= YT-DLP =================
+# ================= ARIA2 WITH PROGRESS =================
+
+async def aria2_download(url, status_msg):
+    cmd = [
+        "aria2c",
+        "--summary-interval=1",
+        "--file-allocation=trunc",
+        "--dir", DOWNLOAD_DIR,
+        url
+    ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT
+    )
+
+    last = 0
+    while True:
+        line = await proc.stdout.readline()
+        if not line:
+            break
+
+        text = line.decode(errors="ignore").strip()
+        if "%" in text:
+            now = asyncio.get_event_loop().time()
+            if now - last > 1.2:
+                last = now
+                await status_msg.edit(f"⬇️ **aria2**\n\n`{text}`")
+
+    if await proc.wait() != 0:
+        raise Exception("aria2 failed")
+
+# ================= YT-DLP (UNCHANGED) =================
 
 async def ytdlp_download(url, status_msg):
     out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
@@ -171,7 +193,6 @@ async def ytdlp_download(url, status_msg):
     )
 
     last_edit = 0
-
     while True:
         line = await process.stdout.readline()
         if not line:
@@ -180,7 +201,7 @@ async def ytdlp_download(url, status_msg):
         text = line.decode(errors="ignore").strip()
         if "[download]" in text and "%" in text:
             now = asyncio.get_event_loop().time()
-            if now - last_edit >= 1.2:
+            if now - last_edit > 1.2:
                 last_edit = now
                 await status_msg.edit(f"⬇️ **Downloading**\n\n`{text}`")
 
@@ -201,22 +222,26 @@ async def handler(_, m: Message):
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-        # ---------- GOFILE ----------
+        # ---------- GOFILE PIPELINE ----------
         if is_gofile(url):
-            try:
-                files = get_gofile_files(url)
-                for name, link in files:
-                    out = os.path.join(DOWNLOAD_DIR, name)
-                    subprocess.run(
-                        ["curl", "-L", "--fail", link, "-o", out],
-                        check=True
-                    )
-            except Exception as e:
-                # ---------- JDOWLOADER FALLBACK ----------
-                jd = shutil.which("jd-cli") or shutil.which("jdownloader")
-                if not jd:
-                    raise Exception(f"GoFile failed and JD not found: {e}")
+            jd = shutil.which("jdownloader") or shutil.which("jd-cli")
+
+            if jd:
+                await status.edit("⬇️ **JDownloader**")
                 subprocess.run([jd, "-d", DOWNLOAD_DIR, url], check=True)
+
+            else:
+                try:
+                    await status.edit("⬇️ **aria2**")
+                    await aria2_download(url, status)
+                except Exception:
+                    files = scrape_gofile(url)
+                    for name, link in files:
+                        subprocess.run(
+                            ["curl", "-L", "--fail", link, "-o",
+                             os.path.join(DOWNLOAD_DIR, name)],
+                            check=True
+                        )
 
         # ---------- EVERYTHING ELSE ----------
         else:
@@ -232,11 +257,7 @@ async def handler(_, m: Message):
             fixed = faststart(f)
             thumb = generate_thumb(fixed)
 
-            parts = (
-                [fixed]
-                if os.path.getsize(fixed) < SPLIT_SIZE
-                else split_file(fixed)
-            )
+            parts = [fixed] if os.path.getsize(fixed) < SPLIT_SIZE else split_file(fixed)
 
             for p in parts:
                 await app.send_video(
