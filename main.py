@@ -5,9 +5,7 @@ import shutil
 import subprocess
 import asyncio
 import base64
-
-import cloudscraper
-from bs4 import BeautifulSoup
+import requests
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -83,93 +81,31 @@ def split_file(path):
 
 def generate_thumb(video):
     thumb = video.rsplit(".", 1)[0] + ".jpg"
-    try:
-        duration = float(subprocess.check_output([
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=nw=1:nk=1",
-            video
-        ]).decode().strip())
-        seek = max(1, int(duration // 2))
-    except Exception:
-        seek = 1
-
     subprocess.run(
-        ["ffmpeg", "-y", "-ss", str(seek), "-i", video,
-         "-vframes", "1", "-vf",
-         "scale=320:320:force_original_aspect_ratio=decrease",
-         "-q:v", "5", thumb],
+        ["ffmpeg", "-y", "-i", video, "-ss", "00:00:01", "-vframes", "1", thumb],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+        stderr=subprocess.DEVNULL,
     )
+    return thumb if os.path.exists(thumb) else None
 
-    if not os.path.exists(thumb) or os.path.getsize(thumb) > 200 * 1024:
-        if os.path.exists(thumb):
-            os.remove(thumb)
-        return None
+# ================= ARIA2 =================
 
-    return thumb
-
-# ================= GOFILE =================
-
-def is_gofile(url):
-    return "gofile.io/d/" in url
-
-def scrape_gofile(url):
-    scraper = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "desktop": True}
-    )
-    r = scraper.get(url, timeout=30)
-    if r.status_code != 200:
-        raise Exception(f"GoFile HTTP {r.status_code}")
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    files = []
-
-    for script in soup.find_all("script"):
-        if script.string and "directLink" in script.string:
-            names = re.findall(r'"name":"(.*?)"', script.string)
-            links = re.findall(r'"directLink":"(https:\\/\\/.*?)"', script.string)
-            for n, l in zip(names, links):
-                files.append((n, l.replace("\\/", "/")))
-
-    if not files:
-        raise Exception("Scrape failed")
-
-    return files
-
-# ================= ARIA2 WITH PROGRESS =================
-
-async def aria2_download(url, status_msg):
+def aria2_download(url):
     cmd = [
         "aria2c",
-        "--summary-interval=1",
+        "-x", "8",
+        "-s", "8",
+        "-k", "1M",
         "--file-allocation=trunc",
-        "--dir", DOWNLOAD_DIR,
+        "-d", DOWNLOAD_DIR,
         url
     ]
+    subprocess.run(cmd, check=True)
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT
-    )
+# ================= GOFILE (REALISTIC) =================
 
-    last = 0
-    while True:
-        line = await proc.stdout.readline()
-        if not line:
-            break
-
-        text = line.decode(errors="ignore").strip()
-        if "%" in text:
-            now = asyncio.get_event_loop().time()
-            if now - last > 1.2:
-                last = now
-                await status_msg.edit(f"⬇️ **aria2**\n\n`{text}`")
-
-    if await proc.wait() != 0:
-        raise Exception("aria2 failed")
+def is_gofile(url):
+    return "gofile.io" in url
 
 # ================= YT-DLP (UNCHANGED) =================
 
@@ -203,7 +139,7 @@ async def ytdlp_download(url, status_msg):
             now = asyncio.get_event_loop().time()
             if now - last_edit > 1.2:
                 last_edit = now
-                await status_msg.edit(f"⬇️ **Downloading**\n\n`{text}`")
+                await status_msg.edit(f"⬇️ Downloading\n`{text}`")
 
     if await process.wait() != 0:
         raise Exception("yt-dlp failed")
@@ -216,34 +152,18 @@ async def handler(_, m: Message):
     if not url.startswith("http"):
         return
 
-    status = await m.reply("🔍 Detecting...")
+    status = await m.reply("🔍 Detecting link...")
 
     try:
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-        # ---------- GOFILE PIPELINE ----------
+        # ---- GOFILE → ARIA2 ONLY ----
         if is_gofile(url):
-            jd = shutil.which("jdownloader") or shutil.which("jd-cli")
+            await status.edit("⬇️ Downloading via aria2...")
+            aria2_download(url)
 
-            if jd:
-                await status.edit("⬇️ **JDownloader**")
-                subprocess.run([jd, "-d", DOWNLOAD_DIR, url], check=True)
-
-            else:
-                try:
-                    await status.edit("⬇️ **aria2**")
-                    await aria2_download(url, status)
-                except Exception:
-                    files = scrape_gofile(url)
-                    for name, link in files:
-                        subprocess.run(
-                            ["curl", "-L", "--fail", link, "-o",
-                             os.path.join(DOWNLOAD_DIR, name)],
-                            check=True
-                        )
-
-        # ---------- EVERYTHING ELSE ----------
+        # ---- EVERYTHING ELSE ----
         else:
             await ytdlp_download(url, status)
 
@@ -265,7 +185,7 @@ async def handler(_, m: Message):
                     video=p,
                     thumb=thumb,
                     supports_streaming=True,
-                    caption=os.path.basename(p),
+                    caption=os.path.basename(p)
                 )
                 os.remove(p)
 
