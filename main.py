@@ -1,148 +1,195 @@
-import os, re, math, shutil, subprocess, requests, time, asyncio, aria2p
+import os, re, math, shutil, subprocess, requests, time, base64
 from urllib.parse import urlparse
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
 # ================= CONFIG =================
+
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 GOFILE_API_TOKEN = os.getenv("GOFILE_API_TOKEN") 
 
 DOWNLOAD_DIR = "downloads"
+SPLIT_SIZE = 1900 * 1024 * 1024
+COOKIES_FILE = "cookies.txt"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+ALLOWED_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
+MEGA_RE = re.compile(r"https?://mega\.nz/")
+BUNKR_RE = re.compile(r"https?://(?:[a-z0-9]+\.)?bunkr\.(?:cr|pk|fi|ru|black|st|is)/")
 GOFILE_RE = re.compile(r"https?://gofile\.io/d/([A-Za-z0-9]+)")
 
-# ================= ARIA2 SETUP =================
-# Start aria2 daemon
-subprocess.Popen(["aria2c", "--enable-rpc", "--rpc-listen-all", "--rpc-allow-origin-all", "--max-connection-per-server=16", "--split=16", "--daemon"])
-time.sleep(2)
-aria2 = aria2p.API(aria2p.Client(host="http://localhost", port=6800, secret=""))
+# ================= PROGRESS BAR HELPERS =================
 
-# ================= HELPERS =================
-def get_progress_bar(current, total):
+def get_pb(current, total):
     percentage = (current / total) * 100 if total > 0 else 0
     done = int(percentage / 10)
     return f"[{'█' * done}{'░' * (10 - done)}] {percentage:.1f}%"
 
-async def tg_progress(current, total, message, tag):
+async def progress_func(current, total, message, tag):
     now = time.time()
-    if not hasattr(tg_progress, "last"): tg_progress.last = 0
-    if now - tg_progress.last < 4: return 
-    tg_progress.last = now
-    bar = get_progress_bar(current, total)
+    if not hasattr(progress_func, "last"):
+        progress_func.last = 0
+    if now - progress_func.last < 3:
+        return
+    progress_func.last = now
+    bar = get_pb(current, total)
     try:
-        await message.edit(f"**{tag}**\n{bar}\n`{current/1024/1024:.2f} / {total/1024/1024:.2f} MB`")
-    except: pass
-
-async def aria2_progress(gid, message, tag):
-    while True:
-        try:
-            download = aria2.get_download(gid)
-            if download.is_complete: break
-            if download.has_failed: 
-                raise Exception(f"Aria2 failed: {download.error_message}")
-            
-            bar = get_progress_bar(download.completed_length, download.total_length)
-            msg = (f"**{tag}**\n{bar}\n"
-                   f"`{download.completed_length_string()} / {download.total_length_string()}`\n"
-                   f"🚀 Speed: `{download.download_speed_string()}`")
-            await message.edit(msg)
-            await asyncio.sleep(4)
-        except: break
-
-def generate_thumbnail(video_path):
-    thumb_path = f"{video_path}.jpg"
-    cmd = ["ffmpeg", "-y", "-i", video_path, "-ss", "00:00:01", "-vframes", "1", thumb_path]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return thumb_path if os.path.exists(thumb_path) else None
+        await message.edit(
+            f"**{tag}**\n{bar}\n"
+            f"`{current/1024/1024:.2f} / {total/1024/1024:.2f} MB`"
+        )
+    except:
+        pass
 
 # ================= CLIENT =================
-app = Client("userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
-async def download_gofile_aria(content_id, status_msg):
-    headers = {"Authorization": f"Bearer {GOFILE_API_TOKEN}", "User-Agent": UA}
-    api_url = f"api.gofile.io{content_id}"
-    res = requests.get(api_url, headers=headers)
+app = Client(
+    "userbot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION_STRING
+)
+
+# ================= HELPERS =================
+
+def extract_clean_url(text):
+    match = re.search(r'(https?://[^\s\n]+)', text)
+    return match.group(1) if match else None
+
+# ---------- GOFILE DOWNLOADER ----------
+async def download_gofile(content_id, status_msg):
+    headers = {
+        "Authorization": f"Bearer {GOFILE_API_TOKEN}",
+        "User-Agent": UA
+    }
+
+    res = requests.get(
+        f"https://api.gofile.io/getContent?contentId={content_id}",
+        headers=headers
+    )
     if res.status_code != 200:
-        raise Exception(f"GoFile API Error {res.status_code}")
-    
-    data = res.json()
-    contents = data.get("data", {}).get("contents", data.get("data", {}).get("children", {}))
-    video_items = [item for item in contents.values() if item.get("type") == "file"]
-    
-    if not video_items:
-        raise Exception("No videos found in this folder.")
+        raise Exception("GoFile API error")
 
-    for i, item in enumerate(video_items, 1):
-        tag = f"Leeching {i}/{len(video_items)}"
-        options = {"dir": DOWNLOAD_DIR, "out": item["name"], "header": f"Authorization: Bearer {GOFILE_API_TOKEN}"}
-        download = aria2.add_uris([item["directLink"]], options=options)
-        await aria2_progress(download.gid, status_msg, tag)
+    data = res.json()
+    contents = data["data"]["children"]
+
+    for item in contents.values():
+        if item["type"] != "file":
+            continue
+
+        out_path = os.path.join(DOWNLOAD_DIR, item["name"])
+
+        with requests.get(item["directLink"], stream=True) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("content-length", 0))
+            current = 0
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    f.write(chunk)
+                    current += len(chunk)
+                    await progress_func(
+                        current, total, status_msg, "Downloading"
+                    )
+
+# ---------- YT-DLP ----------
+def download_ytdlp(url, out_pattern):
+    parsed = urlparse(url)
+    referer = f"{parsed.scheme}://{parsed.netloc}/"
+    subprocess.run([
+        "yt-dlp",
+        "--no-playlist",
+        "--cookies", COOKIES_FILE,
+        "--user-agent", UA,
+        "--add-header", f"Referer:{referer}",
+        "--merge-output-format", "mp4",
+        "-o", out_pattern,
+        url
+    ], check=True)
+
+# ---------- VIDEO FIX + THUMB ----------
+def faststart_and_thumb(src):
+    base = src.rsplit(".", 1)[0]
+    fixed = f"{base}_fixed.mp4"
+    thumb = f"{base}.jpg"
+
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", src, "-movflags", "+faststart", "-c", "copy", fixed],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", fixed, "-ss", "00:00:01", "-vframes", "1", thumb],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    os.remove(src)
+    return fixed, thumb if os.path.exists(thumb) else None
+
+# ---------- SPLIT ----------
+def split_file(path):
+    parts = []
+    size = os.path.getsize(path)
+    count = math.ceil(size / SPLIT_SIZE)
+    with open(path, "rb") as f:
+        for i in range(count):
+            part = f"{path}.part{i+1}.mp4"
+            with open(part, "wb") as o:
+                o.write(f.read(SPLIT_SIZE))
+            parts.append(part)
+    os.remove(path)
+    return parts
 
 # ================= HANDLER =================
-@app.on_message(filters.me & filters.private & filters.text)
+
+@app.on_message(filters.private & filters.text)
 async def handler(client, m: Message):
-    if m.chat.id != client.me.id: return 
-    
-    url_match = re.search(r'(https?://[^\s\n]+)', m.text)
-    if not url_match: return
-    url = url_match.group(1)
-    
-    status = await m.reply("🛰️ Processing Link...")
+    url = extract_clean_url(m.text)
+    if not url:
+        return
 
-    try:
-        # Clear and rebuild download dir
-        if os.path.exists(DOWNLOAD_DIR):
-            shutil.rmtree(DOWNLOAD_DIR)
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    status = await m.reply("⏬ Starting download...")
 
-        if (gf := GOFILE_RE.search(url)):
-            await status.edit("📁 GoFile folder detected...")
-            await download_gofile_aria(gf.group(1), status)
-        else:
-            await status.edit("🔗 Direct Link detected...")
-            download = aria2.add_uris([url], options={"dir": DOWNLOAD_DIR})
-            await aria2_progress(download.gid, status, "Downloading")
+    if GOFILE_RE.search(url):
+        cid = GOFILE_RE.search(url).group(1)
+        await download_gofile(cid, status)
 
-        # GET ALL FILES EXCEPT THUMBNAILS
-        files = [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR) if not f.endswith('.jpg')]
-        
-        if not files:
-            raise Exception("Download directory is empty. Nothing was leached.")
+    elif url.startswith("http"):
+        out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
+        download_ytdlp(url, out)
 
-        for i, f_path in enumerate(files, 1):
-            tag = f"Uploading {i}/{len(files)}"
-            
-            # Check size (Max 2GB for standard userbots)
-            if os.path.getsize(f_path) > 2000 * 1024 * 1024:
-                await status.edit(f"⚠️ `{os.path.basename(f_path)}` is too large (>2GB). Skipping.")
-                continue
+    await status.edit("🎞 Processing video...")
 
-            thumb = generate_thumbnail(f_path)
-            
-            await client.send_video(
-                chat_id="me", 
-                video=f_path, 
+    for file in os.listdir(DOWNLOAD_DIR):
+        path = os.path.join(DOWNLOAD_DIR, file)
+        if not path.lower().endswith(ALLOWED_EXT):
+            continue
+
+        fixed, thumb = faststart_and_thumb(path)
+        parts = [fixed]
+
+        if os.path.getsize(fixed) > SPLIT_SIZE:
+            parts = split_file(fixed)
+
+        for p in parts:
+            await m.reply_video(
+                video=p,
                 thumb=thumb,
                 supports_streaming=True,
-                caption=f"`{os.path.basename(f_path)}`",
-                progress=tg_progress,
-                progress_args=(status, tag)
+                progress=progress_func,
+                progress_args=("Uploading",)
             )
-            
-            if thumb and os.path.exists(thumb): os.remove(thumb)
-            os.remove(f_path)
+            os.remove(p)
 
-        await status.edit("✅ All available videos sent to Saved Messages.")
-    except Exception as e:
-        await status.edit(f"❌ Error: `{str(e)}`")
-    finally:
-        # Ensure directory is cleaned even on failure
-        if os.path.exists(DOWNLOAD_DIR):
-            shutil.rmtree(DOWNLOAD_DIR)
+        if thumb and os.path.exists(thumb):
+            os.remove(thumb)
 
-if __name__ == "__main__":
-    app.run()
+    shutil.rmtree(DOWNLOAD_DIR)
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# ================= START =================
+
+app.run()
