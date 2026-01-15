@@ -62,7 +62,6 @@ def collect_files(root):
 # ---------- GOFILE DOWNLOADER (MULTI-VIDEO SUPPORT) ----------
 async def download_gofile(content_id, status_msg):
     headers = {"Authorization": f"Bearer {GOFILE_API_TOKEN}", "User-Agent": UA}
-    # FIXED: Added proper protocol and slash
     res = requests.get(f"api.gofile.io{content_id}", headers=headers)
     if res.status_code != 200:
         raise Exception(f"GoFile API {res.status_code}. Token might be invalid.")
@@ -77,7 +76,6 @@ async def download_gofile(content_id, status_msg):
         tag = f"Downloading Video {i}/{total}"
         out_path = os.path.join(DOWNLOAD_DIR, item["name"])
         
-        # Download with manual progress bar
         with requests.get(item["directLink"], headers=headers, stream=True) as r:
             r.raise_for_status()
             file_total = int(r.headers.get('content-length', 0))
@@ -123,8 +121,13 @@ def split_file(path):
 
 # ================= USERBOT HANDLER =================
 
-@app.on_message(filters.private & filters.text)
+# Updated filter: triggers only for messages you send to yourself (Saved Messages)
+@app.on_message(filters.me & filters.private & filters.text)
 async def handler(client, m: Message):
+    # Security: Ensure this is actually the Saved Messages chat
+    if m.chat.id != client.me.id:
+        return
+
     url = extract_clean_url(m.text)
     if not url: return
     status = await m.reply("⏳ Processing...")
