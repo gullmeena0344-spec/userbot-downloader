@@ -54,12 +54,31 @@ def collect_files():
 
 def faststart(src):
     fixed = src.rsplit(".", 1)[0] + "_fixed.mp4"
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", src, "-map", "0", "-c", "copy", "-movflags", "+faststart", fixed],
+
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", src,
+            "-map", "0",
+            "-c", "copy",
+            "-movflags", "+faststart",
+            fixed
+        ],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
     )
-    os.remove(src)
+
+    # 🔒 IMPORTANT: check if ffmpeg really created the file
+    if os.path.exists(fixed) and os.path.getsize(fixed) > 0:
+        os.remove(src)
+        return fixed
+    else:
+        # ffmpeg failed → keep original
+        if os.path.exists(fixed):
+            os.remove(fixed)
+        return src
+        
+
     return fixed
 
 def split_file(path):
