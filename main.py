@@ -120,58 +120,73 @@ def generate_thumb(video):
     return thumb
 
 # ================= GOFILE (ADDED) =================
+# ================= GOFILE (HARDENED 2026) =================
 
 def is_gofile(url):
-    return "gofile.io/d/" in url
+    return "gofile.io/d/" in url or "gofile.io/download/" in url
+
 
 def get_gofile_files(content_id):
     if not GOFILE_API_TOKEN:
         raise Exception("GOFILE_API_TOKEN not set")
 
-    # 1. Get the dynamic API server (Required for uploads/downloads)
-    s = requests.get("https://api.gofile.io/getServer", timeout=15).json()
-    if s.get("status") != "ok":
-        raise Exception("Failed to get GoFile server")
-    server = s["data"]["server"]
+    headers = {
+        "Authorization": f"Bearer {GOFILE_API_TOKEN}",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json",
+        "Origin": "https://gofile.io",
+        "Referer": "https://gofile.io/",
+    }
 
-    # 2. Call getContent - Ensure you use the specific account-based headers
-    # Note: This endpoint now requires a Premium account as of 2025/2026.
-    r = requests.get(
-        f"api.gofile.io{content_id}",
-        headers={
-            "Authorization": f"Bearer {GOFILE_API_TOKEN}",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json"
-        },
-        timeout=30
-    )
+    url = f"https://api.gofile.io/contents/{content_id}"
+
+    r = requests.get(url, headers=headers, timeout=30)
+
+    # ---------- CLOUDFLARE / HTML GUARD ----------
+    if "text/html" in r.headers.get("Content-Type", ""):
+        raise Exception(
+            "GoFile blocked this request (Cloudflare). "
+            "Free VPS IPs are commonly blocked."
+        )
 
     if r.status_code == 404:
-        raise Exception("GoFile link not found or content is private")
-    if r.status_code == 429:
-        raise Exception("Rate limit exceeded - GoFile enforces strict limits in 2026")
+        raise Exception("GoFile link not found or private")
+
+    if r.status_code == 403:
+        raise Exception(
+            "GoFile folder listing requires PREMIUM account (2026 rule)"
+        )
+
     if r.status_code != 200:
-        raise Exception(f"GoFile HTTP {r.status_code}: {r.text}")
+        raise Exception(f"GoFile HTTP {r.status_code}")
 
-    data = r.json()
+    try:
+        data = r.json()
+    except Exception:
+        raise Exception("GoFile returned invalid JSON")
+
     if data.get("status") != "ok":
-        # Handle the specific 'premium_only' error common in 2026
-        error_msg = data.get("error", "Unknown API error")
-        raise Exception(f"GoFile API error: {error_msg}")
+        err = data.get("error", "Unknown GoFile error")
+        raise Exception(err)
 
-    # 3. Extract direct links from the 'children' or 'contents' object
     files = []
-    contents = data["data"].get("children", data["data"].get("contents", {}))
-    
-    for item_id, item in contents.items():
+    contents = data["data"].get("children", {})
+
+    for item in contents.values():
         if item.get("type") == "file":
-            # directLink is valid but may require the Bearer token to download
             files.append((item["name"], item["directLink"]))
 
     if not files:
-        raise Exception("No files found or folder is empty")
+        raise Exception(
+            "Folder detected but cannot list files on FREE account"
+        )
 
     return files
+    
     
 
 
