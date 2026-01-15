@@ -5,8 +5,9 @@ import shutil
 import subprocess
 import asyncio
 import base64
-import requests
-from urllib.parse import urlparse
+
+import cloudscraper
+from bs4 import BeautifulSoup
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -20,8 +21,6 @@ SESSION_STRING = os.getenv("SESSION_STRING")
 DOWNLOAD_DIR = "downloads"
 COOKIES_FILE = "cookies.txt"
 SPLIT_SIZE = 1900 * 1024 * 1024  # 1.9GB
-
-GOFILE_API_TOKEN = os.getenv("GOFILE_API_TOKEN")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -80,7 +79,7 @@ def split_file(path):
     os.remove(path)
     return parts
 
-# ================= THUMBNAIL (FIXED) =================
+# ================= THUMBNAIL =================
 
 def generate_thumb(video):
     thumb = video.rsplit(".", 1)[0] + ".jpg"
@@ -119,81 +118,38 @@ def generate_thumb(video):
 
     return thumb
 
-# ================= GOFILE (ADDED) =================
-# ================= GOFILE (HARDENED 2026) =================
+# ================= GOFILE (SCRAPING – FREE SAFE) =================
 
 def is_gofile(url):
-    return "gofile.io/d/" in url or "gofile.io/download/" in url
+    return "gofile.io/d/" in url
 
+def get_gofile_files(url):
+    scraper = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "desktop": True}
+    )
 
-def get_gofile_files(content_id):
-    if not GOFILE_API_TOKEN:
-        raise Exception("GOFILE_API_TOKEN not set")
-
-    headers = {
-        "Authorization": f"Bearer {GOFILE_API_TOKEN}",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json",
-        "Origin": "https://gofile.io",
-        "Referer": "https://gofile.io/",
-    }
-
-    url = f"https://api.gofile.io/contents/{content_id}"
-
-    r = requests.get(url, headers=headers, timeout=30)
-
-    # ---------- CLOUDFLARE / HTML GUARD ----------
-    if "text/html" in r.headers.get("Content-Type", ""):
-        raise Exception(
-            "GoFile blocked this request (Cloudflare). "
-            "Free VPS IPs are commonly blocked."
-        )
-
-    if r.status_code == 404:
-        raise Exception("GoFile link not found or private")
-
-    if r.status_code == 403:
-        raise Exception(
-            "GoFile folder listing requires PREMIUM account (2026 rule)"
-        )
-
+    r = scraper.get(url, timeout=30)
     if r.status_code != 200:
         raise Exception(f"GoFile HTTP {r.status_code}")
 
-    try:
-        data = r.json()
-    except Exception:
-        raise Exception("GoFile returned invalid JSON")
-
-    if data.get("status") != "ok":
-        err = data.get("error", "Unknown GoFile error")
-        raise Exception(err)
-
+    soup = BeautifulSoup(r.text, "html.parser")
     files = []
-    contents = data["data"].get("children", {})
 
-    for item in contents.values():
-        if item.get("type") == "file":
-            files.append((item["name"], item["directLink"]))
+    for script in soup.find_all("script"):
+        if script.string and "directLink" in script.string:
+            text = script.string
+            names = re.findall(r'"name":"(.*?)"', text)
+            links = re.findall(r'"directLink":"(https:\\/\\/.*?)"', text)
+
+            for n, l in zip(names, links):
+                files.append((n, l.replace("\\/", "/")))
 
     if not files:
-        raise Exception(
-            "Folder detected but cannot list files on FREE account"
-        )
+        raise Exception("No files found (private / password / blocked)")
 
     return files
-    
-    
 
-
-
-
-
-# ================= YT-DLP WITH PROGRESS =================
+# ================= YT-DLP =================
 
 async def ytdlp_download(url, status_msg):
     out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
@@ -222,16 +178,11 @@ async def ytdlp_download(url, status_msg):
             break
 
         text = line.decode(errors="ignore").strip()
-
         if "[download]" in text and "%" in text:
             now = asyncio.get_event_loop().time()
-            if now - last_edit < 1.2:
-                continue
-            last_edit = now
-            await status_msg.edit(
-                "⬇️ **Downloading**\n\n"
-                f"`{text}`"
-            )
+            if now - last_edit >= 1.2:
+                last_edit = now
+                await status_msg.edit(f"⬇️ **Downloading**\n\n`{text}`")
 
     if await process.wait() != 0:
         raise Exception("yt-dlp failed")
@@ -244,7 +195,7 @@ async def handler(_, m: Message):
     if not url.startswith("http"):
         return
 
-    status = await m.reply("🔍 Detecting video...")
+    status = await m.reply("🔍 Detecting...")
 
     try:
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
@@ -252,12 +203,20 @@ async def handler(_, m: Message):
 
         # ---------- GOFILE ----------
         if is_gofile(url):
-            content_id = url.rstrip("/").split("/")[-1]
-            files = get_gofile_files(content_id)
-
-            for name, link in files:
-                out = os.path.join(DOWNLOAD_DIR, name)
-                subprocess.run(["curl", "-L", link, "-o", out], check=True)
+            try:
+                files = get_gofile_files(url)
+                for name, link in files:
+                    out = os.path.join(DOWNLOAD_DIR, name)
+                    subprocess.run(
+                        ["curl", "-L", "--fail", link, "-o", out],
+                        check=True
+                    )
+            except Exception as e:
+                # ---------- JDOWLOADER FALLBACK ----------
+                jd = shutil.which("jd-cli") or shutil.which("jdownloader")
+                if not jd:
+                    raise Exception(f"GoFile failed and JD not found: {e}")
+                subprocess.run([jd, "-d", DOWNLOAD_DIR, url], check=True)
 
         # ---------- EVERYTHING ELSE ----------
         else:
@@ -267,7 +226,7 @@ async def handler(_, m: Message):
         if not files:
             raise Exception("No files downloaded")
 
-        await status.edit("📦 Processing video...")
+        await status.edit("📦 Processing...")
 
         for f in files:
             fixed = faststart(f)
