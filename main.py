@@ -1,30 +1,29 @@
-import os, re, math, shutil, subprocess, requests, time, base64
+import os, re, math, shutil, subprocess, requests, time
 from urllib.parse import urlparse
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
 # ================= CONFIG =================
-
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 GOFILE_API_TOKEN = os.getenv("GOFILE_API_TOKEN") 
 
 DOWNLOAD_DIR = "downloads"
-SPLIT_SIZE = 1900 * 1024 * 1024
+SPLIT_SIZE = 1900 * 1024 * 1024  # Standard TG limit
 COOKIES_FILE = "cookies.txt"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 ALLOWED_EXT = (".mp4", ".mkv", ".webm", ".avi", ".mov")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# Regex Patterns
 PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
 MEGA_RE = re.compile(r"https?://mega\.nz/")
 BUNKR_RE = re.compile(r"https?://(?:[a-z0-9]+\.)?bunkr\.(?:cr|pk|fi|ru|black|st|is)/")
 GOFILE_RE = re.compile(r"https?://gofile\.io/d/([A-Za-z0-9]+)")
 
-# ================= PROGRESS BAR HELPERS =================
-
+# ================= PROGRESS HELPERS =================
 def get_pb(current, total):
     percentage = (current / total) * 100 if total > 0 else 0
     done = int(percentage / 10)
@@ -41,11 +40,9 @@ async def progress_func(current, total, message, tag):
     except: pass
 
 # ================= CLIENT =================
-
 app = Client("userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
 # ================= HELPERS =================
-
 def extract_clean_url(text):
     match = re.search(r'(https?://[^\s\n]+)', text)
     return match.group(1) if match else None
@@ -59,64 +56,48 @@ def collect_files(root):
                 files.append(p)
     return files
 
-# ---------- GOFILE DOWNLOADER (FIXED API LOGIC) ----------
+# ---------- GOFILE SOLVER (2026 REFRESHED API) ----------
 async def download_gofile(content_id, status_msg):
+    # API requires Authorization header in 2026 to avoid 403 Forbidden
     headers = {"Authorization": f"Bearer {GOFILE_API_TOKEN}", "User-Agent": UA}
-    # Corrected API endpoint for 2026 GoFile API
     api_url = f"api.gofile.io{content_id}"
-    res = requests.get(api_url, headers=headers)
     
+    res = requests.get(api_url, headers=headers)
     if res.status_code != 200:
-        raise Exception(f"GoFile API Error {res.status_code}. Check if GOFILE_API_TOKEN is correct.")
+        raise Exception(f"GoFile API Error {res.status_code}. Token might be invalid.")
     
     data = res.json()
-    if data.get("status") != "ok":
-        raise Exception(f"GoFile API returned status: {data.get('status')}")
-
-    # Accessing the children (files) in the folder
-    contents = data["data"].get("contents", data["data"].get("children", {}))
+    contents = data.get("data", {}).get("contents", data.get("data", {}).get("children", {}))
     
     video_items = [item for item in contents.values() if item.get("type") == "file"]
-    if not video_items:
-        raise Exception("No files found in this GoFile link.")
-        
-    total = len(video_items)
+    if not video_items: raise Exception("No videos found in this GoFile link.")
     
     for i, item in enumerate(video_items, 1):
-        tag = f"Downloading Video {i}/{total}"
-        file_name = item["name"]
-        out_path = os.path.join(DOWNLOAD_DIR, file_name)
-        direct_link = item["directLink"]
-        
-        # Download using requests with token to bypass cookie/referer issues
-        with requests.get(direct_link, headers=headers, stream=True) as r:
+        tag = f"Downloading Video {i}/{len(video_items)}"
+        out_path = os.path.join(DOWNLOAD_DIR, item["name"])
+        # Use directLink fetched fresh from API
+        with requests.get(item["directLink"], headers=headers, stream=True) as r:
             r.raise_for_status()
             file_total = int(r.headers.get('content-length', 0))
             current = 0
             with open(out_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024*1024):
-                    if chunk:
-                        f.write(chunk)
-                        current += len(chunk)
-                        await progress_func(current, file_total, status_msg, tag)
+                    f.write(chunk)
+                    current += len(chunk)
+                    await progress_func(current, file_total, status_msg, tag)
 
 # ---------- YT-DLP CORE ----------
 def download_ytdlp(url, out_pattern):
     parsed = urlparse(url)
     referer = f"{parsed.scheme}://{parsed.netloc}/"
     cmd = [
-        "yt-dlp", "--no-playlist", 
-        "--cookies", COOKIES_FILE, 
-        "--user-agent", UA,
-        "--add-header", f"Referer:{referer}", 
-        "--merge-output-format", "mp4",
+        "yt-dlp", "--no-playlist", "--user-agent", UA,
+        "--add-header", f"Referer:{referer}", "--merge-output-format", "mp4",
         "-o", out_pattern, url
     ]
-    # If cookies.txt is missing on Railway, yt-dlp will proceed without it
-    if not os.path.exists(COOKIES_FILE):
-        cmd.pop(cmd.index("--cookies") + 1)
-        cmd.remove("--cookies")
-        
+    # Use cookies.txt only if it exists (prevents Railway build errors)
+    if os.path.exists(COOKIES_FILE):
+        cmd.extend(["--cookies", COOKIES_FILE])
     subprocess.run(cmd, check=True)
 
 # ---------- VIDEO PROCESSING ----------
@@ -142,22 +123,22 @@ def split_file(path):
     return parts
 
 # ================= USERBOT HANDLER =================
-
+# Filter: me (only you) & private (saved messages chat matches your ID)
 @app.on_message(filters.me & filters.private & filters.text)
 async def handler(client, m: Message):
-    if m.chat.id != client.me.id:
-        return
-
+    # Double-check it is Saved Messages
+    if m.chat.id != client.me.id: return
+    
     url = extract_clean_url(m.text)
     if not url: return
-    status = await m.reply("⏳ Processing...")
+    status = await m.reply("⏳ Processing in Saved Messages...")
 
     try:
         shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         if (gf := GOFILE_RE.search(url)):
-            await status.edit("📁 GoFile folder detected. Fetching via API...")
+            await status.edit("📁 GoFile detected. Fetching via API...")
             await download_gofile(gf.group(1), status)
         elif (px := PIXELDRAIN_RE.search(url)):
             await status.edit("💧 Pixeldrain detected...")
@@ -172,14 +153,13 @@ async def handler(client, m: Message):
         files = collect_files(DOWNLOAD_DIR)
         if not files: raise Exception("No media found.")
 
-        total_files = len(files)
         for i, f in enumerate(files, 1):
-            tag = f"Uploading {i}/{total_files}"
+            tag = f"Uploading {i}/{len(files)}"
             fixed, thumb = faststart_and_thumb(f)
             parts = [fixed] if os.path.getsize(fixed) < SPLIT_SIZE else split_file(fixed)
             for p in parts:
                 await client.send_video(
-                    chat_id=m.chat.id, 
+                    chat_id="me", 
                     video=p, 
                     thumb=thumb, 
                     supports_streaming=True, 
@@ -190,7 +170,7 @@ async def handler(client, m: Message):
                 if os.path.exists(p): os.remove(p)
             if thumb and os.path.exists(thumb): os.remove(thumb)
 
-        await status.edit("✅ All videos processed successfully.")
+        await status.edit("✅ All videos processed and uploaded to Saved Messages.")
     except Exception as e:
         await status.edit(f"❌ Error:\n`{str(e)}`")
     finally:
