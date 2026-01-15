@@ -128,8 +128,20 @@ def get_gofile_files(content_id):
     if not GOFILE_API_TOKEN:
         raise Exception("GOFILE_API_TOKEN not set")
 
+    # 1️⃣ Get dynamic API server
+    s = requests.get(
+        "https://api.gofile.io/getServer",
+        timeout=15
+    ).json()
+
+    if s.get("status") != "ok":
+        raise Exception("Failed to get GoFile server")
+
+    server = s["data"]["server"]
+
+    # 2️⃣ Call getContent on correct server
     r = requests.get(
-        "https://api.gofile.io/getContent",
+        f"https://{server}.gofile.io/getContent",
         headers={
             "Authorization": f"Bearer {GOFILE_API_TOKEN}",
             "User-Agent": "Mozilla/5.0",
@@ -137,21 +149,22 @@ def get_gofile_files(content_id):
         },
         params={
             "contentId": content_id,
-            "wt": "4fd6sg89d7s6"  # REQUIRED
+            "token": GOFILE_API_TOKEN,
+            "wt": "4fd6sg89d7s6"
         },
         timeout=30
     )
 
+    if r.status_code == 404:
+        raise Exception("GoFile link not found or blocked")
+
     if r.status_code != 200:
         raise Exception(f"GoFile HTTP {r.status_code}")
-
-    if not r.text.strip():
-        raise Exception("GoFile returned empty response (IP blocked or token invalid)")
 
     try:
         data = r.json()
     except Exception:
-        raise Exception("GoFile did not return JSON (token/IP issue)")
+        raise Exception("GoFile returned non-JSON response")
 
     if data.get("status") != "ok":
         raise Exception(f"GoFile API error: {data}")
@@ -165,6 +178,8 @@ def get_gofile_files(content_id):
         raise Exception("No files found in GoFile folder")
 
     return files
+
+
 
 
 # ================= YT-DLP WITH PROGRESS =================
