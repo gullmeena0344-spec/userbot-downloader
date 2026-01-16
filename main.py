@@ -1,4 +1,4 @@
-import os, re, math, shutil, subprocess, requests, time
+import os, re, shutil, subprocess, requests, time
 from urllib.parse import urlparse
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -9,6 +9,8 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING")
 GOFILE_API_TOKEN = os.getenv("GOFILE_API_TOKEN")
+
+CHANNEL_ID = -1003609000029  # ✅ YOUR CHANNEL (important: -100)
 
 DOWNLOAD_DIR = "downloads"
 SPLIT_SIZE = 1900 * 1024 * 1024
@@ -30,10 +32,19 @@ app = Client(
     session_string=SESSION_STRING
 )
 
+# ================= CLEANUP =================
+
+def cleanup():
+    if os.path.exists(DOWNLOAD_DIR):
+        shutil.rmtree(DOWNLOAD_DIR)
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
 # ================= PROGRESS =================
 
 async def upload_progress(current, total, msg):
-    pct = current * 100 / total if total else 0
+    if total == 0:
+        return
+    pct = current * 100 / total
     bar = f"[{'█'*int(pct//10)}{'░'*(10-int(pct//10))}] {pct:.1f}%"
     try:
         await msg.edit(f"⬆️ Uploading\n{bar}")
@@ -60,32 +71,18 @@ async def download_gofile(cid, status):
 
         out = os.path.join(DOWNLOAD_DIR, f["name"])
         with requests.get(f["directLink"], stream=True) as d:
-            total = int(d.headers.get("content-length", 0))
-            cur = 0
             with open(out, "wb") as o:
-                for c in d.iter_content(1024*1024):
+                for c in d.iter_content(1024 * 1024):
                     o.write(c)
-                    cur += len(c)
-                    pct = cur * 100 / total if total else 0
-                    bar = f"[{'█'*int(pct//10)}{'░'*(10-int(pct//10))}] {pct:.1f}%"
-                    try:
-                        await status.edit(f"⬇️ Downloading\n{bar}")
-                    except:
-                        pass
 
-# ================= YTDLP + ARIA2 =================
+# ================= YT-DLP =================
 
-async def download_with_aria2(url, status):
-    parsed = urlparse(url)
-
+async def download_ytdlp(url, status):
     out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
 
     cmd = [
         "yt-dlp",
-        "--newline",
         "--no-playlist",
-        "--downloader", "aria2c",
-        "--downloader-args", "aria2c:-x16 -s16 -k1M",
         "--cookies", COOKIES_FILE,
         "--user-agent", UA,
         "--merge-output-format", "mp4",
@@ -93,25 +90,7 @@ async def download_with_aria2(url, status):
         url
     ]
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True
-    )
-
-    last = 0
-    for line in proc.stdout:
-        if "%" in line and time.time() - last > 2:
-            last = time.time()
-            try:
-                pct = float(line.split("%")[0].split()[-1])
-                bar = f"[{'█'*int(pct//10)}{'░'*(10-int(pct//10))}] {pct:.1f}%"
-                await status.edit(f"⬇️ Downloading\n{bar}")
-            except:
-                pass
-
-    proc.wait()
+    subprocess.run(cmd, check=True)
 
 # ================= VIDEO FIX =================
 
@@ -126,7 +105,7 @@ def fix_video(src):
     )
 
     subprocess.run(
-        ["ffmpeg", "-y", "-i", fixed, "-ss", "00:00:10", "-vframes", "1", thumb],
+        ["ffmpeg", "-y", "-i", fixed, "-ss", "00:00:05", "-vframes", "1", thumb],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
@@ -159,12 +138,19 @@ async def handler(_, m: Message):
     if not url:
         return
 
-    status = await m.reply("⏬ Starting...")
+    status = await m.reply("⏬ Downloading...")
 
-    if GOFILE_RE.search(url):
-        await download_gofile(GOFILE_RE.search(url).group(1), status)
-    else:
-        await download_with_aria2(url, status)
+    cleanup()
+
+    try:
+        if GOFILE_RE.search(url):
+            await download_gofile(GOFILE_RE.search(url).group(1), status)
+        else:
+            await download_ytdlp(url, status)
+    except Exception as e:
+        await status.edit(f"❌ Download failed\n{e}")
+        cleanup()
+        return
 
     await status.edit("🎞 Processing...")
 
@@ -181,7 +167,7 @@ async def handler(_, m: Message):
 
         for part in files:
             await app.send_video(
-                m.chat.id,
+                CHANNEL_ID,
                 part,
                 thumb=thumb,
                 supports_streaming=True,
@@ -193,8 +179,8 @@ async def handler(_, m: Message):
         if thumb and os.path.exists(thumb):
             os.remove(thumb)
 
-    shutil.rmtree(DOWNLOAD_DIR)
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    await status.edit("✅ Uploaded to channel")
+    cleanup()
 
 # ================= START =================
 
