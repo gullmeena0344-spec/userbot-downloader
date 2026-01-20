@@ -1,6 +1,5 @@
 import subprocess
 from pathlib import Path
-import math
 
 class Downloader:
     def __init__(self, out_dir="downloads"):
@@ -8,6 +7,9 @@ class Downloader:
         self.out.mkdir(exist_ok=True)
 
     def download(self, url):
+        """
+        Download video using yt-dlp and return Path to downloaded file.
+        """
         out_template = str(self.out / "%(title).200s.%(ext)s")
         cmd = [
             "yt-dlp",
@@ -23,6 +25,9 @@ class Downloader:
 
 
 def generate_thumb(video_path: Path):
+    """
+    Generate thumbnail from 3-second mark.
+    """
     thumb_path = video_path.with_suffix(".jpg")
     subprocess.run([
         "ffmpeg", "-ss", "00:00:03",
@@ -35,7 +40,10 @@ def generate_thumb(video_path: Path):
 
 
 def split_file(file_path: Path, chunk_size=1990 * 1024 * 1024):
-    """Split file into 2GB parts for Telegram."""
+    """
+    Split file into chunks for Telegram (>2GB safe).
+    Returns list of Path objects.
+    """
     parts = []
     file_size = file_path.stat().st_size
     if file_size <= chunk_size:
