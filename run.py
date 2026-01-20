@@ -1,63 +1,83 @@
-import subprocess
+import os
+import asyncio
 from pathlib import Path
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from run import Downloader, generate_thumb, split_file
 
-class Downloader:
-    def __init__(self, out_dir="downloads"):
-        self.out = Path(out_dir)
-        self.out.mkdir(exist_ok=True)
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+SESSION = os.getenv("SESSION_STRING")
 
-    def download(self, url):
-        """
-        Download video using yt-dlp and return Path to downloaded file.
-        """
-        out_template = str(self.out / "%(title).200s.%(ext)s")
-        cmd = [
-            "yt-dlp",
-            "-f", "bv*+ba/b",
-            "--merge-output-format", "mp4",
-            "--no-playlist",
-            "-o", out_template,
-            url
-        ]
-        subprocess.run(cmd, check=True)
-        files = sorted(self.out.glob("*"), key=lambda x: x.stat().st_mtime)
-        return files[-1] if files else None
+bot = Client(session_name=SESSION, api_id=API_ID, api_hash=API_HASH)
+dl = Downloader()
 
 
-def generate_thumb(video_path: Path):
+async def progress_bar(current, total, msg, prefix=""):
     """
-    Generate thumbnail from 3-second mark.
+    Updates Telegram message with progress.
     """
-    thumb_path = video_path.with_suffix(".jpg")
-    subprocess.run([
-        "ffmpeg", "-ss", "00:00:03",
-        "-i", str(video_path),
-        "-vframes", "1",
-        "-q:v", "2",
-        str(thumb_path)
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return str(thumb_path) if thumb_path.exists() else None
+    try:
+        percent = current / total * 100
+        await msg.edit(f"{prefix}{percent:.1f}%")
+    except:
+        pass
 
 
-def split_file(file_path: Path, chunk_size=1990 * 1024 * 1024):
+async def upload_file(m: Message, file_path: Path, thumb=None):
     """
-    Split file into chunks for Telegram (>2GB safe).
-    Returns list of Path objects.
+    Uploads file to Telegram with optional progress bar and splits >2GB.
     """
-    parts = []
-    file_size = file_path.stat().st_size
-    if file_size <= chunk_size:
-        return [file_path]
+    status_msg = await m.reply("⬆️ Uploading...")
+    parts = split_file(file_path)
+    for part in parts:
+        loop = asyncio.get_event_loop()
 
-    with open(file_path, "rb") as f:
-        part_num = 1
-        while True:
-            data = f.read(chunk_size)
-            if not data:
-                break
-            part_path = file_path.with_name(f"{file_path.stem}_part{part_num}.mp4")
-            with open(part_path, "wb") as pf:
-                pf.write(data)
-            parts.append(part_path)
-            part_num += 1
-    return parts
+        def progress_callback(current, total):
+            asyncio.run_coroutine_threadsafe(
+                progress_bar(current, total, status_msg, prefix="⬆️ Uploading: "),
+                loop
+            )
+
+        await m.reply_video(
+            video=str(part),
+            supports_streaming=True,
+            thumb=thumb,
+            progress=progress_callback
+        )
+    await status_msg.delete()
+
+
+@bot.on_message(filters.me & filters.text)
+async def grab(_, m: Message):
+    """
+    Handles incoming links in Saved Messages (filters.me).
+    """
+    url = m.text.strip()
+    if not url.startswith("http"):
+        return
+
+    status_msg = await m.reply("⬇️ Starting download...")
+
+    try:
+        loop = asyncio.get_event_loop()
+        # download in separate thread
+        file_path = await loop.run_in_executor(None, dl.download, url)
+
+        if not file_path:
+            return await status_msg.edit("❌ Download failed")
+
+        # generate thumbnail
+        thumb = generate_thumb(file_path)
+
+        # upload (split if needed)
+        await upload_file(m, file_path, thumb)
+
+        await status_msg.delete()
+
+    except Exception as e:
+        await status_msg.edit(f"❌ {e}")
+
+
+if __name__ == "__main__":
+    bot.run()
