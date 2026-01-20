@@ -1,141 +1,67 @@
 import os
-import re
 import asyncio
-import shutil
-import subprocess
-import threading
+from pathlib import Path
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-# ================= CONFIG =================
+from run import Downloader, generate_thumb, split_file
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-SESSION_STRING = os.getenv("SESSION_STRING")
+SESSION = os.getenv("SESSION_STRING")
 
-# YOUR CHANNEL ID (logs / trash)
-LOG_CHANNEL = -1003609000029  # <-- change if needed
+bot = Client(session_name=SESSION, api_id=API_ID, api_hash=API_HASH)
+dl = Downloader()
 
-DOWNLOAD_DIR = "/tmp/downloads"
-UA = "Mozilla/5.0"
-
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-PIXELDRAIN_RE = re.compile(r"https?://pixeldrain\.com/u/([A-Za-z0-9]+)")
-
-# ================= WEB SERVER (KOYEB NEEDS THIS) =================
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-def start_web():
-    server = HTTPServer(("0.0.0.0", 8000), HealthHandler)
-    server.serve_forever()
-
-threading.Thread(target=start_web, daemon=True).start()
-
-# ================= PYROGRAM =================
-
-app = Client(
-    "userbot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING,
-    in_memory=True
-)
-
-# ================= PROGRESS =================
-
-async def progress(current, total, msg, text):
-    if not total:
-        return
-    percent = current * 100 / total
-    bar = f"[{'█'*int(percent//10)}{'░'*(10-int(percent//10))}] {percent:.1f}%"
+async def progress_bar(current, total, msg, prefix=""):
     try:
-        await msg.edit(f"{text}\n{bar}")
+        percent = current / total * 100
+        await msg.edit(f"{prefix}{percent:.1f}%")
     except:
         pass
 
-# ================= HELPERS =================
-
-def extract_url(text):
-    m = re.search(r"(https?://[^\s]+)", text)
-    return m.group(1) if m else None
-
-# ================= DOWNLOAD =================
-
-async def download(url, status):
-    out = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
-
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--user-agent", UA,
-        "-o", out,
-        url
-    ]
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True
-    )
-
-    for line in proc.stdout:
-        if "%" in line:
-            try:
-                pct = float(line.split("%")[0].split()[-1])
-                bar = f"[{'█'*int(pct//10)}{'░'*(10-int(pct//10))}] {pct:.1f}%"
-                await status.edit(f"⬇️ Downloading\n{bar}")
-            except:
-                pass
-
-    proc.wait()
-
-# ================= HANDLER =================
-
-@app.on_message(filters.private & filters.text)
-async def handler(_, m: Message):
-    url = extract_url(m.text)
-    if not url:
-        return
-
-    status = await m.reply("⏬ Starting download...")
-
-    try:
-        await download(url, status)
-
-        await status.edit("📤 Uploading...")
-
-        for f in os.listdir(DOWNLOAD_DIR):
-            path = os.path.join(DOWNLOAD_DIR, f)
-
-            await app.send_video(
-                "me",  # Saved Messages
-                path,
-                supports_streaming=True,
-                progress=progress,
-                progress_args=(status, "⬆️ Uploading")
+async def upload_file(m, file_path: Path, thumb=None):
+    status_msg = await m.reply("⬆️ Uploading...")
+    parts = split_file(file_path)
+    for part in parts:
+        def upload_progress(current, total):
+            asyncio.run_coroutine_threadsafe(
+                progress_bar(current, total, status_msg, prefix="⬆️ Uploading: "),
+                asyncio.get_event_loop()
             )
 
-            # Log copy
-            await app.send_document(LOG_CHANNEL, path)
+        await m.reply_video(
+            video=str(part),
+            supports_streaming=True,
+            thumb=thumb,
+            progress=upload_progress,
+            progress_args=(status_msg,)
+        )
+    await status_msg.delete()
 
-            os.remove(path)
+@bot.on_message(filters.me & filters.text)
+async def grab(_, m: Message):
+    url = m.text.strip()
+    if not url.startswith("http"):
+        return
+
+    status_msg = await m.reply("⬇️ Starting download...")
+
+    try:
+        loop = asyncio.get_event_loop()
+        file_path = await loop.run_in_executor(None, dl.download, url)
+
+        if not file_path:
+            return await status_msg.edit("❌ Download failed")
+
+        thumb = generate_thumb(file_path)
+
+        await upload_file(m, file_path, thumb)
+
+        await status_msg.delete()
 
     except Exception as e:
-        await app.send_message(LOG_CHANNEL, f"❌ ERROR:\n{e}")
+        await status_msg.edit(f"❌ {e}")
 
-    shutil.rmtree(DOWNLOAD_DIR, ignore_errors=True)
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-    await status.edit("✅ Done")
-
-# ================= START =================
-
-app.run()
+if __name__ == "__main__":
+    bot.run()
